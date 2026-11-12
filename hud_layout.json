@@ -18,19 +18,19 @@
     "fg_opacity": 100
   },
   "steer": {
-    "x": 1229,
-    "y": 493,
-    "w": 989,
-    "h": 578,
+    "x": 1211,
+    "y": 664,
+    "w": 1009,
+    "h": 659,
     "enabled": true,
-    "bg_opacity": 100,
+    "bg_opacity": 0,
     "fg_opacity": 100
   },
   "pedals": {
     "x": 137,
     "y": 1049,
-    "w": 230,
-    "h": 260,
+    "w": 355,
+    "h": 256,
     "enabled": true,
     "bg_opacity": 80,
     "fg_opacity": 100
@@ -45,13 +45,62 @@
     "fg_opacity": 100
   },
   "_options": {
-    "show_clutch": false,
-    "warn_lead_sec": 5.0,
+    "show_clutch": true,
+    "warn_lead_sec": 8.0,
+    "pedals_show_you_pct": true,
+    "pedals_show_ref_pct": false,
     "lock_vk": 119,
     "hide_vk": 120,
-    "cp_ribbon_dx": 0,
-    "cp_ribbon_dy": 0,
-    "cp_gear_mode": "always",
+    "cp_offsets": {
+      "ribbon": [
+        0,
+        0
+      ],
+      "steer": [
+        0,
+        0
+      ],
+      "steer_text": [
+        0,
+        0
+      ],
+      "gear": [
+        0,
+        0
+      ],
+      "speed": [
+        0,
+        0
+      ],
+      "brake": [
+        0,
+        0
+      ],
+      "throttle": [
+        0,
+        0
+      ],
+      "clutch": [
+        0,
+        0
+      ]
+    },
+    "cp_scales": {
+      "ribbon": 100,
+      "steer": 100,
+      "steer_text": 100,
+      "gear": 100,
+      "speed": 100,
+      "brake": 100,
+      "throttle": 100,
+      "clutch": 100
+    },
+    "cp_gear_mode": "mismatch",
+    "cp_ribbon_top_reach": 83,
+    "cp_ribbon_top_fade": 55,
+    "cp_steer_max_deg": 200,
+    "cp_steer_auto_scale": true,
+    "cp_steer_text_color": "#00aaff",
     "cp_show_ribbon": true,
     "cp_show_player_on_rib": true,
     "cp_show_pedal_match": true,
@@ -62,6 +111,8 @@
     "cp_show_brake": true,
     "cp_show_throttle": true,
     "cp_show_clutch": false,
+    "cp_pedal_show_you_pct": true,
+    "cp_pedal_show_ref_pct": false,
     "cp_op_ribbon": 100,
     "cp_op_player_on_rib": 100,
     "cp_op_steer": 100,

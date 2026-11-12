@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 import ctypes
 import threading
 
@@ -10,9 +11,11 @@ except ImportError:
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QDialog, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QCheckBox, QFileDialog, QFrame, QSlider, QMessageBox, QComboBox
+    QLabel, QPushButton, QCheckBox, QFileDialog, QFrame, QSlider, QMessageBox,
+    QComboBox, QColorDialog
 )
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QColor
 
 import irsdk
 from config import CONFIG_FILE, load_config, save_config, vk_to_name
@@ -28,7 +31,6 @@ from widgets import (
 
 
 def get_screen_centered_geoms() -> dict:
-    """Автоматически вычисляет стоковые позиции виджетов по центру текущего монитора."""
     screen = QApplication.primaryScreen()
     if screen is not None:
         geo = screen.availableGeometry()
@@ -37,9 +39,9 @@ def get_screen_centered_geoms() -> dict:
         sx, sy, sw, sh = 0, 0, 1920, 1080
 
     banner_w, banner_h = 460, 84
-    cockpit_w, cockpit_h = 520, 330
+    cockpit_w, cockpit_h = 620, 360
     delta_w, delta_h = 270, 175
-    pedals_w, pedals_h = 230, 260
+    pedals_w, pedals_h = 240, 260
     graph_w, graph_h = 480, 240
 
     cx = sx + (sw - cockpit_w) // 2
@@ -48,7 +50,7 @@ def get_screen_centered_geoms() -> dict:
 
     return {
         "banner": (bx, sy + int(sh * 0.04), banner_w, banner_h, 85),
-        "steer": (cx, sy + int(sh * 0.52), cockpit_w, cockpit_h, 0),
+        "steer": (cx, sy + int(sh * 0.50), cockpit_w, cockpit_h, 0),
         "delta": (sx + margin_x, sy + int(sh * 0.06), delta_w, delta_h, 80),
         "pedals": (sx + margin_x, sy + sh - pedals_h - int(sh * 0.06), pedals_w, pedals_h, 80),
         "graph": (sx + sw - graph_w - margin_x, sy + sh - graph_h - int(sh * 0.06), graph_w, graph_h, 80),
@@ -68,18 +70,17 @@ def qt_key_to_vk(qt_key: int, native_vk: int) -> int:
 
 
 class CockpitSettingsDialog(QDialog):
-    """Отдельное окно детальной настройки элементов, режима передач, позиции траектории и прозрачности Кокпита."""
     def __init__(self, parent_window):
         super().__init__(parent_window)
         self.pw = parent_window
         self.state = parent_window.state
-        self.setWindowTitle("⚙ Настройка элементов виджета Кокпита")
-        self.resize(560, 650)
+        self.setWindowTitle("⚙ Настройка элементов, размеров и позиций виджета Кокпита")
+        self.resize(620, 820)
         self.setStyleSheet(parent_window.styleSheet())
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(10)
+        root.setContentsMargins(16, 10, 16, 10)
+        root.setSpacing(6)
 
         lbl_info = QLabel("Включай/выключай отдельные элементы кокпита и настраивай их прозрачность:")
         lbl_info.setStyleSheet("font-weight: bold; color: #00d2ff; font-size: 13px;")
@@ -88,15 +89,14 @@ class CockpitSettingsDialog(QDialog):
         card = QFrame()
         card.setObjectName("card")
         c_layout = QVBoxLayout(card)
-        c_layout.setSpacing(7)
+        c_layout.setSpacing(5)
 
-        # Отдельная строка выбора режима Передач + её прозрачность
         gear_row = QHBoxLayout()
         lbl_g = QLabel("Отображение Передачи:")
         lbl_g.setStyleSheet("font-weight: bold; font-size: 12px;")
         self.cmb_gear = QComboBox()
+        self.cmb_gear.addItem("Всегда показывать (щиток GEAR + ▲ SHIFT UP)", "always")
         self.cmb_gear.addItem("Только когда передача неверная (исчезает)", "mismatch")
-        self.cmb_gear.addItem("Всегда показывать", "always")
         self.cmb_gear.addItem("Выключено", "off")
         self.cmb_gear.setStyleSheet(
             "QComboBox { background-color: #1a2333; border: 1px solid #2e3e58; border-radius: 5px; padding: 4px 8px; color: #ffffff; }"
@@ -118,17 +118,61 @@ class CockpitSettingsDialog(QDialog):
         gear_row.addWidget(sld_gop)
         c_layout.addLayout(gear_row)
 
+        # 1) Ползунок дальности / высоты траектории сверху
+        reach_row = QHBoxLayout()
+        self.lbl_reach = QLabel(f"Дальность (высота) 3D-траектории сверху: {self.state.cp_ribbon_top_reach}%")
+        self.lbl_reach.setStyleSheet("font-size: 12px; color: #ffd166; font-weight: bold;")
+        self.sld_reach = QSlider(Qt.Orientation.Horizontal)
+        self.sld_reach.setRange(25, 100)
+        self.sld_reach.setValue(self.state.cp_ribbon_top_reach)
+        self.sld_reach.valueChanged.connect(self._on_reach_changed)
+        reach_row.addWidget(self.lbl_reach)
+        reach_row.addWidget(self.sld_reach)
+        c_layout.addLayout(reach_row)
+
+        # 2) Ползунок затухания прозрачности от верха к середине траектории
+        fade_row = QHBoxLayout()
+        self.lbl_fade = QLabel(f"Затухание прозрачности от верха к середине: {self.state.cp_ribbon_top_fade}%")
+        self.lbl_fade.setStyleSheet("font-size: 12px; color: #70e1ff; font-weight: bold;")
+        self.sld_fade = QSlider(Qt.Orientation.Horizontal)
+        self.sld_fade.setRange(0, 100)
+        self.sld_fade.setValue(self.state.cp_ribbon_top_fade)
+        self.sld_fade.valueChanged.connect(self._on_fade_changed)
+        fade_row.addWidget(self.lbl_fade)
+        fade_row.addWidget(self.sld_fade)
+        c_layout.addLayout(fade_row)
+
+        # 3) Диапазон градусов шкалы руля (90..360° в каждую сторону + авто-подстройка по CSV)
+        steer_lim_row = QHBoxLayout()
+        self.lbl_steer_max = QLabel(f"Диапазон шкалы руля: ±{self.state.cp_steer_max_deg}°")
+        self.lbl_steer_max.setStyleSheet("font-size: 12px; color: #55efc4; font-weight: bold;")
+        self.sld_steer_max = QSlider(Qt.Orientation.Horizontal)
+        self.sld_steer_max.setRange(90, 360)
+        self.sld_steer_max.setValue(self.state.cp_steer_max_deg)
+        self.sld_steer_max.valueChanged.connect(self._on_steer_max_changed)
+
+        self.cb_steer_auto = QCheckBox("Авто по рефу")
+        self.cb_steer_auto.setChecked(self.state.cp_steer_auto_scale)
+        self.cb_steer_auto.toggled.connect(self._on_steer_auto_toggled)
+
+        steer_lim_row.addWidget(self.lbl_steer_max)
+        steer_lim_row.addWidget(self.sld_steer_max)
+        steer_lim_row.addWidget(self.cb_steer_auto)
+        c_layout.addLayout(steer_lim_row)
+
         items = [
-            ("cp_show_ribbon", "cp_op_ribbon", "3D-Траектория со степенью нажатия рефа"),
-            ("cp_show_player_on_rib", "cp_op_player_on_rib", "Полоса моей позиции и ползунок с засечками"),
+            ("cp_show_ribbon", "cp_op_ribbon", "3D-Траектория с шевронами и степенью нажатия рефа"),
+            ("cp_show_player_on_rib", "cp_op_player_on_rib", "Полоса моей позиции + мой след педалей на дорожке"),
             ("cp_show_pedal_match", None, "Бирюзовая вспышка полосы при точном попадании в педаль"),
-            ("cp_show_steer", "cp_op_steer", "Дуга угла Руля"),
-            ("cp_show_steer_text", None, "Текст градусов руля (ТЫ / ЭТАЛОН)"),
+            ("cp_show_steer", "cp_op_steer", "Тактическая дуга угла Руля"),
+            ("cp_show_steer_text", None, "Текст градусов руля (STEER -18° — двигается отдельно!)"),
             ("cp_show_speed_you", "cp_op_speed", "Твоя скорость (км/ч)"),
             ("cp_show_speed_ref", None, "Скорость эталона (км/ч)"),
-            ("cp_show_brake", "cp_op_brake", "Встроенная шкала Тормоза (слева)"),
-            ("cp_show_throttle", "cp_op_throttle", "Встроенная шкала Газа (справа)"),
-            ("cp_show_clutch", "cp_op_clutch", "Встроенная шкала Сцепления (слева)"),
+            ("cp_show_brake", "cp_op_brake", "Встроенная капсула Тормоза (BRAKE)"),
+            ("cp_show_throttle", "cp_op_throttle", "Встроенная капсула Газа (THROTTLE)"),
+            ("cp_show_clutch", "cp_op_clutch", "Встроенная капсула Сцепления (CLUTCH)"),
+            ("cp_pedal_show_you_pct", None, "Показывать ТВОИ проценты (81%) рядом со шкалами педалей"),
+            ("cp_pedal_show_ref_pct", None, "Показывать плашку эталона (REF: 60%) рядом со шкалами педалей"),
         ]
 
         self._show_cbs = {}
@@ -141,6 +185,13 @@ class CockpitSettingsDialog(QDialog):
             cb.toggled.connect(lambda checked, a=show_attr: self._on_show_changed(a, checked))
             row.addWidget(cb, stretch=3)
             self._show_cbs[show_attr] = cb
+
+            if show_attr == "cp_show_steer_text":
+                self.btn_steer_col = QPushButton("🎨 Цвет текста руля")
+                self.btn_steer_col.setFixedWidth(145)
+                self._update_color_btn_style()
+                self.btn_steer_col.clicked.connect(self._pick_steer_text_color)
+                row.addWidget(self.btn_steer_col)
 
             if op_attr is not None:
                 cur_op = getattr(self.state, op_attr)
@@ -166,36 +217,67 @@ class CockpitSettingsDialog(QDialog):
         pos_card = QFrame()
         pos_card.setObjectName("card")
         p_layout = QVBoxLayout(pos_card)
-        p_layout.setSpacing(6)
-        lbl_pos = QLabel("Позиция 3D-траектории внутри Кокпита (можно также двигать мышкой за саму дорожку):")
+        p_layout.setSpacing(5)
+        lbl_pos = QLabel("Позиция и размер модулей (тяни мышкой за сам модуль, за его уголок ◢ или крути колёсико):")
         lbl_pos.setStyleSheet("font-weight: bold; color: #ffd166; font-size: 12px;")
         p_layout.addWidget(lbl_pos)
 
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel("Выбери модуль:"))
+        self.cmb_mod = QComboBox()
+        self.cmb_mod.addItem("🎯 Дуга Руля (Steer Arc)", "steer")
+        self.cmb_mod.addItem("🔤 Текст градусов Руля (Steer Text)", "steer_text")
+        self.cmb_mod.addItem("🛣 3D-Траектория (Ribbon)", "ribbon")
+        self.cmb_mod.addItem("⚙ Щиток Передачи (Gear)", "gear")
+        self.cmb_mod.addItem("🚀 Индикатор Скорости (Speed)", "speed")
+        self.cmb_mod.addItem("🔴 Педаль Тормоза (Brake)", "brake")
+        self.cmb_mod.addItem("🟢 Педаль Газа (Throttle)", "throttle")
+        self.cmb_mod.addItem("🔵 Педаль Сцепления (Clutch)", "clutch")
+        self.cmb_mod.setStyleSheet(
+            "QComboBox { background-color: #1a2333; border: 1px solid #00d2ff; border-radius: 5px; padding: 4px 8px; color: #ffffff; font-weight: bold; }"
+        )
+        self.cmb_mod.currentIndexChanged.connect(self.sync_sliders_from_state)
+        sel_row.addWidget(self.cmb_mod, stretch=2)
+        p_layout.addLayout(sel_row)
+
+        row_sc = QHBoxLayout()
+        self.lbl_sc = QLabel("Масштаб: 100%")
+        self.lbl_sc.setFixedWidth(135)
+        self.sld_sc = QSlider(Qt.Orientation.Horizontal)
+        self.sld_sc.setRange(40, 250)
+        self.sld_sc.valueChanged.connect(self._on_sc_changed)
+        row_sc.addWidget(self.lbl_sc)
+        row_sc.addWidget(self.sld_sc)
+        p_layout.addLayout(row_sc)
+
         row_x = QHBoxLayout()
-        self.lbl_dx = QLabel(f"Смещение X: {self.state.cp_ribbon_dx} px")
-        self.lbl_dx.setFixedWidth(130)
+        self.lbl_dx = QLabel("Смещение X: 0 px")
+        self.lbl_dx.setFixedWidth(135)
         self.sld_dx = QSlider(Qt.Orientation.Horizontal)
-        self.sld_dx.setRange(-220, 220)
-        self.sld_dx.setValue(self.state.cp_ribbon_dx)
+        self.sld_dx.setRange(-400, 400)
         self.sld_dx.valueChanged.connect(self._on_dx_changed)
         row_x.addWidget(self.lbl_dx)
         row_x.addWidget(self.sld_dx)
         p_layout.addLayout(row_x)
 
         row_y = QHBoxLayout()
-        self.lbl_dy = QLabel(f"Смещение Y: {self.state.cp_ribbon_dy} px")
-        self.lbl_dy.setFixedWidth(130)
+        self.lbl_dy = QLabel("Смещение Y: 0 px")
+        self.lbl_dy.setFixedWidth(135)
         self.sld_dy = QSlider(Qt.Orientation.Horizontal)
-        self.sld_dy.setRange(-150, 150)
-        self.sld_dy.setValue(self.state.cp_ribbon_dy)
+        self.sld_dy.setRange(-300, 300)
         self.sld_dy.valueChanged.connect(self._on_dy_changed)
         row_y.addWidget(self.lbl_dy)
         row_y.addWidget(self.sld_dy)
         p_layout.addLayout(row_y)
 
-        btn_reset_pos = QPushButton("↺ Сбросить позицию траектории в центр (0, 0)")
-        btn_reset_pos.clicked.connect(self._reset_ribbon_pos)
-        p_layout.addWidget(btn_reset_pos)
+        btn_row_pos = QHBoxLayout()
+        btn_reset_cur = QPushButton("↺ Сбросить выбранный модуль")
+        btn_reset_cur.clicked.connect(self._reset_current_mod_pos)
+        btn_reset_all_mods = QPushButton("↺ Сбросить ВСЕ модули кокпита")
+        btn_reset_all_mods.clicked.connect(self._reset_all_mods_pos)
+        btn_row_pos.addWidget(btn_reset_cur)
+        btn_row_pos.addWidget(btn_reset_all_mods)
+        p_layout.addLayout(btn_row_pos)
         root.addWidget(pos_card)
 
         btn_close = QPushButton("✓ Готово")
@@ -204,6 +286,23 @@ class CockpitSettingsDialog(QDialog):
 
         self.sync_all_from_state()
 
+    def _update_color_btn_style(self):
+        c = self.state.cp_steer_text_color
+        self.btn_steer_col.setStyleSheet(
+            f"QPushButton {{ background-color: #1a2333; border: 2px solid {c}; color: {c}; padding: 3px 6px; font-size: 11px; }}"
+        )
+
+    def _pick_steer_text_color(self):
+        col = QColorDialog.getColor(QColor(self.state.cp_steer_text_color), self, "Выберите цвет текста градусов руля")
+        if col.isValid():
+            self.state.cp_steer_text_color = col.name()
+            self._update_color_btn_style()
+            self.pw._save_global_opts()
+            self.pw.hud_widgets["steer"].update()
+
+    def _cur_mod_key(self) -> str:
+        return self.cmb_mod.currentData() or "steer"
+
     def _on_gear_mode_changed(self, idx: int):
         mode = self.cmb_gear.itemData(idx)
         if mode:
@@ -211,12 +310,62 @@ class CockpitSettingsDialog(QDialog):
             self.pw._save_global_opts()
             self.pw.hud_widgets["steer"].update()
 
+    def _on_reach_changed(self, val: int):
+        self.state.cp_ribbon_top_reach = int(val)
+        self.lbl_reach.setText(f"Дальность (высота) 3D-траектории сверху: {val}%")
+        self.pw._save_global_opts()
+        self.pw.hud_widgets["steer"].update()
+
+    def _on_fade_changed(self, val: int):
+        self.state.cp_ribbon_top_fade = int(val)
+        self.lbl_fade.setText(f"Затухание прозрачности от верха к середине: {val}%")
+        self.pw._save_global_opts()
+        self.pw.hud_widgets["steer"].update()
+
+    def _on_steer_max_changed(self, val: int):
+        self.state.cp_steer_max_deg = int(val)
+        self.lbl_steer_max.setText(f"Диапазон шкалы руля: ±{val}°")
+        self.pw._save_global_opts()
+        self.pw.hud_widgets["steer"].update()
+
+    def _on_steer_auto_toggled(self, checked: bool):
+        self.state.cp_steer_auto_scale = checked
+        if checked and self.state.ref_data:
+            self.pw._auto_calibrate_steer_range(self.state.ref_data)
+            self.sld_steer_max.blockSignals(True)
+            self.sld_steer_max.setValue(self.state.cp_steer_max_deg)
+            self.lbl_steer_max.setText(f"Диапазон шкалы руля: ±{self.state.cp_steer_max_deg}°")
+            self.sld_steer_max.blockSignals(False)
+        self.pw._save_global_opts()
+        self.pw.hud_widgets["steer"].update()
+
     def sync_all_from_state(self):
         self.cmb_gear.blockSignals(True)
         idx = self.cmb_gear.findData(self.state.cp_gear_mode)
         if idx >= 0:
             self.cmb_gear.setCurrentIndex(idx)
         self.cmb_gear.blockSignals(False)
+
+        self.sld_reach.blockSignals(True)
+        self.sld_reach.setValue(self.state.cp_ribbon_top_reach)
+        self.lbl_reach.setText(f"Дальность (высота) 3D-траектории сверху: {self.state.cp_ribbon_top_reach}%")
+        self.sld_reach.blockSignals(False)
+
+        self.sld_fade.blockSignals(True)
+        self.sld_fade.setValue(self.state.cp_ribbon_top_fade)
+        self.lbl_fade.setText(f"Затухание прозрачности от верха к середине: {self.state.cp_ribbon_top_fade}%")
+        self.sld_fade.blockSignals(False)
+
+        self.sld_steer_max.blockSignals(True)
+        self.sld_steer_max.setValue(self.state.cp_steer_max_deg)
+        self.lbl_steer_max.setText(f"Диапазон шкалы руля: ±{self.state.cp_steer_max_deg}°")
+        self.sld_steer_max.blockSignals(False)
+
+        self.cb_steer_auto.blockSignals(True)
+        self.cb_steer_auto.setChecked(self.state.cp_steer_auto_scale)
+        self.cb_steer_auto.blockSignals(False)
+
+        self._update_color_btn_style()
 
         for attr, cb in self._show_cbs.items():
             cb.blockSignals(True)
@@ -231,30 +380,61 @@ class CockpitSettingsDialog(QDialog):
         self.sync_sliders_from_state()
 
     def sync_sliders_from_state(self):
+        mk = self._cur_mod_key()
+        dx, dy = self.state.cp_offsets.get(mk, [0, 0])
+        sc = int(self.state.cp_scales.get(mk, 100))
+
+        self.sld_sc.blockSignals(True)
         self.sld_dx.blockSignals(True)
         self.sld_dy.blockSignals(True)
-        self.sld_dx.setValue(self.state.cp_ribbon_dx)
-        self.sld_dy.setValue(self.state.cp_ribbon_dy)
-        self.lbl_dx.setText(f"Смещение X: {self.state.cp_ribbon_dx} px")
-        self.lbl_dy.setText(f"Смещение Y: {self.state.cp_ribbon_dy} px")
+
+        self.sld_sc.setValue(sc)
+        self.sld_dx.setValue(int(dx))
+        self.sld_dy.setValue(int(dy))
+
+        self.lbl_sc.setText(f"Масштаб: {sc}%")
+        self.lbl_dx.setText(f"Смещение X: {int(dx)} px")
+        self.lbl_dy.setText(f"Смещение Y: {int(dy)} px")
+
+        self.sld_sc.blockSignals(False)
         self.sld_dx.blockSignals(False)
         self.sld_dy.blockSignals(False)
 
+    def _on_sc_changed(self, val: int):
+        mk = self._cur_mod_key()
+        self.state.cp_scales[mk] = int(val)
+        self.lbl_sc.setText(f"Масштаб: {val}%")
+        self.pw._save_global_opts()
+        self.pw.hud_widgets["steer"].update()
+
     def _on_dx_changed(self, val: int):
-        self.state.cp_ribbon_dx = int(val)
+        mk = self._cur_mod_key()
+        _, dy = self.state.cp_offsets.get(mk, [0, 0])
+        self.state.cp_offsets[mk] = [int(val), int(dy)]
         self.lbl_dx.setText(f"Смещение X: {val} px")
         self.pw._save_global_opts()
         self.pw.hud_widgets["steer"].update()
 
     def _on_dy_changed(self, val: int):
-        self.state.cp_ribbon_dy = int(val)
+        mk = self._cur_mod_key()
+        dx, _ = self.state.cp_offsets.get(mk, [0, 0])
+        self.state.cp_offsets[mk] = [int(dx), int(val)]
         self.lbl_dy.setText(f"Смещение Y: {val} px")
         self.pw._save_global_opts()
         self.pw.hud_widgets["steer"].update()
 
-    def _reset_ribbon_pos(self):
-        self.state.cp_ribbon_dx = 0
-        self.state.cp_ribbon_dy = 0
+    def _reset_current_mod_pos(self):
+        mk = self._cur_mod_key()
+        self.state.cp_offsets[mk] = [0, 0]
+        self.state.cp_scales[mk] = 100
+        self.sync_sliders_from_state()
+        self.pw._save_global_opts()
+        self.pw.hud_widgets["steer"].update()
+
+    def _reset_all_mods_pos(self):
+        for k in self.state.cp_offsets:
+            self.state.cp_offsets[k] = [0, 0]
+            self.state.cp_scales[k] = 100
         self.sync_sliders_from_state()
         self.pw._save_global_opts()
         self.pw.hud_widgets["steer"].update()
@@ -275,7 +455,7 @@ class ControlPanelWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("iRacing Coach — Панель управления")
-        self.resize(620, 690)
+        self.resize(630, 720)
         self.setStyleSheet("""
             QMainWindow, QDialog, QWidget { background-color: #10151e; color: #e4e8f0; font-family: 'Segoe UI'; }
             QPushButton {
@@ -342,17 +522,36 @@ class ControlPanelWindow(QMainWindow):
         opts = self.layout_cfg.get("_options", {})
         self.state.show_clutch = bool(opts.get("show_clutch", False))
         self.state.warn_lead_sec = float(opts.get("warn_lead_sec", 5.0))
+        self.state.pedals_show_you_pct = bool(opts.get("pedals_show_you_pct", True))
+        self.state.pedals_show_ref_pct = bool(opts.get("pedals_show_ref_pct", True))
         self.lock_vk = int(opts.get("lock_vk", 0x77))
         self.hide_vk = int(opts.get("hide_vk", 0x78))
-        self.state.cp_ribbon_dx = int(opts.get("cp_ribbon_dx", 0))
-        self.state.cp_ribbon_dy = int(opts.get("cp_ribbon_dy", 0))
-        self.state.cp_gear_mode = str(opts.get("cp_gear_mode", "mismatch"))
+        self.state.cp_gear_mode = str(opts.get("cp_gear_mode", "always"))
+        self.state.cp_ribbon_top_reach = int(opts.get("cp_ribbon_top_reach", 75))
+        self.state.cp_ribbon_top_fade = int(opts.get("cp_ribbon_top_fade", 55))
+        self.state.cp_steer_max_deg = int(opts.get("cp_steer_max_deg", 220))
+        self.state.cp_steer_auto_scale = bool(opts.get("cp_steer_auto_scale", True))
+        self.state.cp_steer_text_color = str(opts.get("cp_steer_text_color", "#c8e1f5"))
+
+        default_offsets = TelemetryState().cp_offsets
+        saved_offsets = opts.get("cp_offsets", {})
+        for k in default_offsets:
+            if k in saved_offsets and isinstance(saved_offsets[k], list) and len(saved_offsets[k]) == 2:
+                self.state.cp_offsets[k] = [int(saved_offsets[k][0]), int(saved_offsets[k][1])]
+            else:
+                self.state.cp_offsets[k] = [0, 0]
+
+        default_scales = TelemetryState().cp_scales
+        saved_scales = opts.get("cp_scales", {})
+        for k in default_scales:
+            self.state.cp_scales[k] = int(saved_scales.get(k, 100))
 
         for attr in (
             "cp_show_ribbon", "cp_show_player_on_rib", "cp_show_pedal_match",
             "cp_show_steer", "cp_show_steer_text",
             "cp_show_speed_you", "cp_show_speed_ref",
-            "cp_show_brake", "cp_show_throttle", "cp_show_clutch"
+            "cp_show_brake", "cp_show_throttle", "cp_show_clutch",
+            "cp_pedal_show_you_pct", "cp_pedal_show_ref_pct",
         ):
             setattr(self.state, attr, bool(opts.get(attr, getattr(TelemetryState(), attr))))
 
@@ -412,9 +611,9 @@ class ControlPanelWindow(QMainWindow):
         opt_card.setObjectName("card")
         opt_layout = QVBoxLayout(opt_card)
         opt_layout.setContentsMargins(10, 10, 10, 10)
-        opt_layout.setSpacing(8)
+        opt_layout.setSpacing(6)
 
-        btn_cockpit_cfg = QPushButton("🎛 Настроить элементы и прозрачность виджета Кокпита...")
+        btn_cockpit_cfg = QPushButton("🎛 Настроить элементы, затухание, размеры и позиции Кокпита...")
         btn_cockpit_cfg.setStyleSheet(
             "QPushButton { background-color: #16364d; border: 1px solid #00d2ff; padding: 9px; font-size: 13px; }"
             "QPushButton:hover { background-color: #1f4c6b; }"
@@ -426,6 +625,17 @@ class ControlPanelWindow(QMainWindow):
         self.cb_clutch.setChecked(self.state.show_clutch)
         self.cb_clutch.toggled.connect(self._on_clutch_toggled)
         opt_layout.addWidget(self.cb_clutch)
+
+        ped_pct_row = QHBoxLayout()
+        self.cb_ped_you = QCheckBox("Отдельные Педали: показывать мои %")
+        self.cb_ped_you.setChecked(self.state.pedals_show_you_pct)
+        self.cb_ped_you.toggled.connect(self._on_ped_pct_toggled)
+        self.cb_ped_ref = QCheckBox("Отдельные Педали: показывать плашку REF %")
+        self.cb_ped_ref.setChecked(self.state.pedals_show_ref_pct)
+        self.cb_ped_ref.toggled.connect(self._on_ped_pct_toggled)
+        ped_pct_row.addWidget(self.cb_ped_you)
+        ped_pct_row.addWidget(self.cb_ped_ref)
+        opt_layout.addLayout(ped_pct_row)
 
         lead_row = QHBoxLayout()
         self.lbl_lead = QLabel(f"Предупреждать о тормозе заранее за: {self.state.warn_lead_sec:.1f} сек")
@@ -511,11 +721,17 @@ class ControlPanelWindow(QMainWindow):
         root.addWidget(btn_reset_all)
         root.addStretch()
 
+    def _on_ped_pct_toggled(self):
+        self.state.pedals_show_you_pct = self.cb_ped_you.isChecked()
+        self.state.pedals_show_ref_pct = self.cb_ped_ref.isChecked()
+        self._save_global_opts()
+        self.hud_widgets["pedals"].update()
+
     def reset_all_to_defaults(self):
         reply = QMessageBox.question(
             self,
             "Сброс настроек",
-            "Вернуть все окна оверлеев по центру текущего экрана, сбросить их размеры, прозрачность, бинды клавиш и настройки кокпита в сток?",
+            "Вернуть все окна оверлеев по центру текущего экрана, сбросить их размеры, прозрачность, бинды клавиш и позиции модулей кокпита в сток?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -530,10 +746,19 @@ class ControlPanelWindow(QMainWindow):
 
         self.layout_cfg.clear()
         self._apply_opts_from_cfg()
+        if self.state.ref_data and self.state.cp_steer_auto_scale:
+            self._auto_calibrate_steer_range(self.state.ref_data)
 
         self.cb_clutch.blockSignals(True)
         self.cb_clutch.setChecked(self.state.show_clutch)
         self.cb_clutch.blockSignals(False)
+
+        self.cb_ped_you.blockSignals(True)
+        self.cb_ped_ref.blockSignals(True)
+        self.cb_ped_you.setChecked(self.state.pedals_show_you_pct)
+        self.cb_ped_ref.setChecked(self.state.pedals_show_ref_pct)
+        self.cb_ped_you.blockSignals(False)
+        self.cb_ped_ref.blockSignals(False)
 
         self.sld_lead.blockSignals(True)
         self.sld_lead.setValue(int(self.state.warn_lead_sec * 10))
@@ -627,11 +852,18 @@ class ControlPanelWindow(QMainWindow):
         self.layout_cfg["_options"] = {
             "show_clutch": self.state.show_clutch,
             "warn_lead_sec": self.state.warn_lead_sec,
+            "pedals_show_you_pct": self.state.pedals_show_you_pct,
+            "pedals_show_ref_pct": self.state.pedals_show_ref_pct,
             "lock_vk": self.lock_vk,
             "hide_vk": self.hide_vk,
-            "cp_ribbon_dx": self.state.cp_ribbon_dx,
-            "cp_ribbon_dy": self.state.cp_ribbon_dy,
+            "cp_offsets": self.state.cp_offsets,
+            "cp_scales": self.state.cp_scales,
             "cp_gear_mode": self.state.cp_gear_mode,
+            "cp_ribbon_top_reach": self.state.cp_ribbon_top_reach,
+            "cp_ribbon_top_fade": self.state.cp_ribbon_top_fade,
+            "cp_steer_max_deg": self.state.cp_steer_max_deg,
+            "cp_steer_auto_scale": self.state.cp_steer_auto_scale,
+            "cp_steer_text_color": self.state.cp_steer_text_color,
             "cp_show_ribbon": self.state.cp_show_ribbon,
             "cp_show_player_on_rib": self.state.cp_show_player_on_rib,
             "cp_show_pedal_match": self.state.cp_show_pedal_match,
@@ -642,6 +874,8 @@ class ControlPanelWindow(QMainWindow):
             "cp_show_brake": self.state.cp_show_brake,
             "cp_show_throttle": self.state.cp_show_throttle,
             "cp_show_clutch": self.state.cp_show_clutch,
+            "cp_pedal_show_you_pct": self.state.cp_pedal_show_you_pct,
+            "cp_pedal_show_ref_pct": self.state.cp_pedal_show_ref_pct,
             "cp_op_ribbon": self.state.cp_op_ribbon,
             "cp_op_player_on_rib": self.state.cp_op_player_on_rib,
             "cp_op_steer": self.state.cp_op_steer,
@@ -698,6 +932,16 @@ class ControlPanelWindow(QMainWindow):
         if path:
             self.load_reference_file(path)
 
+    def _auto_calibrate_steer_range(self, rows):
+        """Определяет пиковый угол руля в эталоне и выставляет оптимальный диапазон шкалы (не менее 200°)."""
+        if not rows:
+            return
+        max_rad = max(abs(r.get("SteeringWheelAngle", 0.0)) for r in rows)
+        max_deg = math.degrees(max_rad)
+        # Добавляем 15% запаса сверху и округляем до 10 градусов (минимум 200°, максимум 360°)
+        auto_deg = int(math.ceil((max_deg * 1.15) / 10.0) * 10)
+        self.state.cp_steer_max_deg = max(200, min(360, auto_deg))
+
     def load_reference_file(self, path: str):
         rows = load_garage61_csv(path)
         if not rows:
@@ -705,9 +949,13 @@ class ControlPanelWindow(QMainWindow):
             return
         self.state.ref_data = rows
         self.state.brake_zones = self._detect_brake_zones(rows)
+        if self.state.cp_steer_auto_scale:
+            self._auto_calibrate_steer_range(rows)
+            if self.cockpit_dlg is not None:
+                self.cockpit_dlg.sync_all_from_state()
         lap_dur = rows[-1]["Time"]
         self.lbl_ref.setText(
-            f"Эталон: {os.path.basename(path)} ({len(rows)} точек, ~{lap_dur:.1f} с, зон торможения: {len(self.state.brake_zones)})"
+            f"Эталон: {os.path.basename(path)} ({len(rows)} точек, ~{lap_dur:.1f} с, шкала руля: ±{self.state.cp_steer_max_deg}°)"
         )
 
     def _detect_brake_zones(self, rows):

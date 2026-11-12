@@ -20,9 +20,11 @@ class TelemetryState:
         self.laps_remain = -1
         self.position = 0
 
-        # Глобальные настройки
+        # Глобальные настройки и настройки отдельного виджета Педалей
         self.show_clutch = False
         self.warn_lead_sec = 5.0
+        self.pedals_show_you_pct = True
+        self.pedals_show_ref_pct = True
 
         # Вкл/Выкл элементов центрального Кокпит-виджета
         self.cp_show_ribbon = True
@@ -31,12 +33,28 @@ class TelemetryState:
         self.cp_show_steer = True
         self.cp_show_steer_text = True
         # Режим передач: "mismatch" (только при неверной), "always" (всегда), "off" (выкл)
-        self.cp_gear_mode = "mismatch"
+        self.cp_gear_mode = "always"
         self.cp_show_speed_you = True
         self.cp_show_speed_ref = True
         self.cp_show_brake = True
         self.cp_show_throttle = True
         self.cp_show_clutch = False
+
+        # Настройки текста процентов на педалях внутри Кокпита
+        self.cp_pedal_show_you_pct = True
+        self.cp_pedal_show_ref_pct = True
+
+        # 1) Дальность/высота 3D-траектории (25..100%)
+        self.cp_ribbon_top_reach = 75
+        # 2) Сила затухания прозрачности от верха к середине траектории (0..100%)
+        self.cp_ribbon_top_fade = 55
+
+        # Максимальный угол шкалы руля в каждую сторону (90..360 градусов, по умолчанию 220°)
+        self.cp_steer_max_deg = 220
+        self.cp_steer_auto_scale = True  # Авто-подстройка под максимум загруженного рефа
+
+        # Цвет текста градусов руля (HEX)
+        self.cp_steer_text_color = "#c8e1f5"
 
         # Индивидуальная прозрачность (10..100%) каждого элемента Кокпита
         self.cp_op_ribbon = 100
@@ -48,9 +66,29 @@ class TelemetryState:
         self.cp_op_throttle = 100
         self.cp_op_clutch = 100
 
-        # Смещение 3D-траектории внутри виджета Кокпита (в пикселях)
-        self.cp_ribbon_dx = 0
-        self.cp_ribbon_dy = 0
+        # Индивидуальные смещения (dx, dy в пикселях) для КАЖДОГО модуля внутри Кокпита
+        self.cp_offsets = {
+            "ribbon": [0, 0],
+            "steer": [0, 0],
+            "steer_text": [0, 0],
+            "gear": [0, 0],
+            "speed": [0, 0],
+            "brake": [0, 0],
+            "throttle": [0, 0],
+            "clutch": [0, 0],
+        }
+
+        # Индивидуальный масштаб (40..250%) для КАЖДОГО модуля внутри Кокпита
+        self.cp_scales = {
+            "ribbon": 100,
+            "steer": 100,
+            "steer_text": 100,
+            "gear": 100,
+            "speed": 100,
+            "brake": 100,
+            "throttle": 100,
+            "clutch": 100,
+        }
 
         # Эталон в текущей точке
         self.t_speed = 0.0
