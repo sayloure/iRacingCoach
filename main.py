@@ -7,7 +7,8 @@ Usage::
 
 The overlay starts unlocked (draggable, buttons clickable).  Press **F8** to
 toggle click-through mode and **Ctrl+F12** to quit; both work globally even
-when iRacing has the focus.
+when iRacing has the focus.  **Esc** does nothing on purpose: closing the
+"load reference" file dialog must never quit the overlay.
 """
 
 from __future__ import annotations
@@ -46,6 +47,12 @@ def main(argv=None) -> int:
     app = QApplication(sys.argv[:1])
     # Allow Ctrl+C to terminate the Qt loop cleanly.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
+    # Never let a transient dialog (e.g. QFileDialog) close the app when it is
+    # dismissed; the overlay must survive until Ctrl+F12 or the close button.
+    # This works together with DontUseNativeDialog in _on_load_ibt —
+    # together they ensure that closing/cancelling the file dialog with Esc
+    # never propagates a window-close event.
+    app.setQuitOnLastWindowClosed(False)
 
     reader = TelemetryReader(demo=args.demo)
     reader.connect()

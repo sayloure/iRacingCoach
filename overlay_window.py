@@ -20,6 +20,7 @@ pyqtgraph plots comparing the driver against the reference lap.
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 from collections import deque
@@ -40,7 +41,7 @@ from PyQt6.QtWidgets import (
 
 import pyqtgraph as pg
 
-from reference_manager import ReferenceManager
+from reference_manager import ReferenceManager, _format_lap_time
 from telemetry_reader import TelemetryFrame, TelemetryReader
 
 try:  # Windows-only audible cue.
@@ -194,6 +195,9 @@ class OverlayWindow(QWidget):
         self._prev_keys = {_VK_F8: False, _VK_F12: False}
         self._cue_zone_dist: Optional[float] = None
         self._cue_active = False
+        # Persisted message shown after a load until the reference changes.
+        self._load_status: str = ""
+        self._loaded_name: str = ""
 
         self.setWindowTitle("iRacing Coach")
         self.setWindowFlags(
@@ -251,7 +255,7 @@ class OverlayWindow(QWidget):
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
         buttons.setContentsMargins(0, 0, 0, 0)
-        self._btn_ibt = QPushButton("Загрузить .ibt")
+        self._btn_ibt = QPushButton("Загрузить эталон")
         self._btn_ref = QPushButton("Круг → эталон")
         self._btn_lock = QPushButton("F8: клики сквозь")
         for b in (self._btn_ibt, self._btn_ref, self._btn_lock):
@@ -393,19 +397,41 @@ class OverlayWindow(QWidget):
     def mouseReleaseEvent(self, event):  # noqa: N802
         self._drag_pos = None
 
+    # Esc is *not* handled here intentionally — the overlay never quits on a
+    # single Esc.  The QFileDialog in _on_load_ibt uses DontUseNativeDialog so
+    # closing/cancelling the dialog with Esc stays inside Qt and never
+    # propagates a window-close event to the overlay.  Ctrl+F12 or the window
+    # close button are the only ways to exit (see _poll_hotkeys).
+
     # -- slots -------------------------------------------------------------
 
     def _on_load_ibt(self) -> None:
+        # DontUseNativeDialog keeps the dialog inside Qt so dismissing it with
+        # Esc/cancel can never propagate a window-close to the overlay.  This
+        # must stay in place together with setQuitOnLastWindowClosed(False) in
+        # main.py — neither alone is sufficient on all systems.
         path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите .ibt файл телеметрии", "", "iRacing telemetry (*.ibt)"
+            self,
+            "Выберите файл эталонной телеметрии",
+            "",
+            "Телеметрия (*.csv *.ibt *.json);;Все файлы (*.*)",
+            "",
+            QFileDialog.Option.DontUseNativeDialog,
         )
         if not path:
             return
         try:
-            self._refs.load_ibt(path)
-            self._ref_label.setText(f"Эталон: {self._refs.reference_name}")
-        except Exception as exc:
-            self._ref_label.setText(f"Ошибка .ibt: {exc}")
+            self._refs.load_reference(path)
+            ref = self._refs.reference
+            ext = os.path.splitext(path)[1].lower().lstrip(".").upper()
+            info = f"{os.path.basename(path)} [{ext}]"
+            if ref is not None and ref.lap_time > 0.0:
+                info += f" • круг {_format_lap_time(ref.lap_time)}"
+            self._load_status = f"Эталон: {info}"
+            self._ref_label.setText(self._load_status)
+        except Exception as e:
+            self._load_status = f"Ошибка загрузки: {e}"
+            self._ref_label.setText(self._load_status)
 
     def _on_commit_lap(self) -> None:
         # Start recording if nothing is buffered yet.
@@ -429,6 +455,11 @@ class OverlayWindow(QWidget):
         if frame.connected:
             self._refs.feed(frame)
 
+        # Adopt the real track length for a percent-only reference so brake-zone
+        # and delta readouts are expressed in metres.
+        if frame.connected and self._refs.has_reference and frame.lap_dist_pct > 0.02:
+            self._refs.reference.ensure_length(frame.lap_dist / frame.lap_dist_pct)
+
         self._update_status(frame)
         self._update_bars(frame)
         self._update_delta(frame)
@@ -445,7 +476,10 @@ class OverlayWindow(QWidget):
         else:
             self._status.setText("Waiting for iRacing...")
             self._status.setStyleSheet(f"color:{_WARN};")
-        self._ref_label.setText(f"Эталон: {self._refs.reference_name}")
+        if self._load_status:
+            self._ref_label.setText(self._load_status)
+        else:
+            self._ref_label.setText(f"Эталон: {self._refs.reference_name}")
 
     def _update_bars(self, frame: TelemetryFrame) -> None:
         self.bar_speed_p.set_value(frame.speed_kmh, f"{frame.speed_kmh:.0f} км/ч")
@@ -455,7 +489,7 @@ class OverlayWindow(QWidget):
 
         ref_vals = None
         if self._refs.has_reference:
-            ref_vals = self._refs.reference.sample(frame.lap_dist)
+            ref_vals = self._refs.reference.sample(frame.lap_dist, frame.lap_dist_pct)
 
         if ref_vals:
             self.bar_speed_r.set_value(ref_vals["speed_kmh"], f"{ref_vals['speed_kmh']:.0f} км/ч")
@@ -480,7 +514,9 @@ class OverlayWindow(QWidget):
             return
 
         player_t = self._current_lap_time(frame)
-        ref_t = self._refs.reference.time_at(frame.lap_dist)
+        ref_t = self._refs.reference.sample(
+            frame.lap_dist, frame.lap_dist_pct
+        ).get("lap_time_at", 0.0)
         if ref_t <= 0.0 and player_t <= 0.0:
             self._delta_label.setText("Δ: -")
             self._delta_label.setStyleSheet(
@@ -489,9 +525,10 @@ class OverlayWindow(QWidget):
             )
             return
 
-        # Positive delta => player is *ahead* (faster) than the reference.
-        delta = ref_t - player_t
-        if delta >= 0.0:
+        # Negative delta => player is *ahead* (faster) than the reference  →  green.
+        # Positive delta => player is *behind* (slower) than the reference →  red.
+        delta = player_t - ref_t
+        if delta <= 0.0:
             color = _PLAYER
             bg = "rgba(58,208,122,40)"
         else:
@@ -519,9 +556,13 @@ class OverlayWindow(QWidget):
             self._cue_zone_dist = None
             return
 
-        zone = self._refs.reference.brake_zone_time_ahead(frame.lap_dist)
+        zone = self._refs.reference.brake_zone_time_ahead(
+            frame.lap_dist, frame.lap_dist_pct
+        )
         if zone is None:
-            dist = self._refs.reference.brake_zone_ahead(frame.lap_dist)
+            dist = self._refs.reference.brake_zone_ahead(
+                frame.lap_dist, frame.lap_dist_pct
+            )
             ref_t = None
         else:
             dist, ref_t = zone
@@ -567,7 +608,7 @@ class OverlayWindow(QWidget):
     def _update_plots(self, frame: TelemetryFrame) -> None:
         ref_vals = None
         if self._refs.has_reference:
-            ref_vals = self._refs.reference.sample(frame.lap_dist)
+            ref_vals = self._refs.reference.sample(frame.lap_dist, frame.lap_dist_pct)
 
         thr_r = ref_vals["throttle"] if ref_vals else 0.0
         brk_r = ref_vals["brake"] if ref_vals else 0.0
