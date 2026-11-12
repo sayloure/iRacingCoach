@@ -5,8 +5,9 @@ Usage::
     python main.py            # attach to a running iRacing session
     python main.py --demo     # run with synthetic telemetry (no game needed)
 
-Press **F8** to toggle between edit mode (draggable) and locked mode (clicks
-pass through to the game).  **Esc** closes the overlay.
+The overlay starts unlocked (draggable, buttons clickable).  Press **F8** to
+toggle click-through mode and **Ctrl+F12** to quit; both work globally even
+when iRacing has the focus.
 """
 
 from __future__ import annotations
@@ -50,7 +51,10 @@ def main(argv=None) -> int:
     reader.connect()
 
     references = ReferenceManager()
-    references.load_default()
+    if not references.load_default() and args.demo:
+        # No saved lap on disk: install a synthetic reference so the demo shows
+        # overlaid traces, a live time delta and a brake-zone cue right away.
+        references.load_synthetic(lap_length=reader._demo_lap_length)
 
     window = OverlayWindow(reader, references)
     window.show()

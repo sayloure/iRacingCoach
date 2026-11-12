@@ -48,6 +48,7 @@ class ReferenceLap:
     brake: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float64))
     gear: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float64))
     steering_deg: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float64))
+    lap_time_at: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float64))
     lap_time: float = 0.0
 
     def __len__(self) -> int:
@@ -89,7 +90,88 @@ class ReferenceLap:
             "brake": float(self.brake[i]),
             "gear": int(self.gear[i]),
             "steering_deg": float(self.steering_deg[i]),
+            "lap_time_at": self.time_at(lap_dist),
         }
+
+    def time_at(self, lap_dist: float) -> float:
+        """Reference lap time (seconds since lap start) at ``lap_dist``.
+
+        Falls back to a linear estimate from ``lap_time`` when per-point
+        timing was not stored (older reference files).  Returns ``0.0`` when
+        nothing usable is known.
+        """
+        if not self.is_valid:
+            return 0.0
+        if self.lap_time_at.size == self.lap_dist.size:
+            return float(self.lap_time_at[self.index_at(lap_dist)])
+        # Linear fallback: interpolate between 0 and lap_time over the lap.
+        length = self.length
+        if length > 0.0 and self.lap_time > 0.0:
+            return float(self.lap_time) * (float(lap_dist) / length)
+        return 0.0
+
+    def brake_zone_time_ahead(self, lap_dist: float) -> Optional[tuple]:
+        """Return ``(distance_m, reference_lap_time)`` for the next zone.
+
+        ``reference_lap_time`` is the absolute time on the reference lap at
+        which braking starts.  Returns ``None`` when no braking occurs within
+        :data:`BRAKE_LOOKAHEAD` metres.
+        """
+        if not self.is_valid:
+            return None
+        start = self.index_at(lap_dist)
+        limit = lap_dist + BRAKE_LOOKAHEAD
+        i = start
+        n = self.lap_dist.size
+        while i < n and self.lap_dist[i] <= limit:
+            if self.brake[i] > BRAKE_THRESHOLD:
+                dist = float(self.lap_dist[i] - lap_dist)
+                ref_t = (
+                    float(self.lap_time_at[i])
+                    if self.lap_time_at.size == self.lap_dist.size
+                    else self.time_at(self.lap_dist[i])
+                )
+                return dist, ref_t
+            i += 1
+        return None
+
+    @classmethod
+    def synthetic(
+        cls,
+        lap_length: float = 5400.0,
+        lap_time: float = 105.0,
+        samples: int = 1500,
+        name: str = "demo-reference",
+    ) -> "ReferenceLap":
+        """Build a smooth synthetic reference lap (used by ``--demo``).
+
+        The shape mirrors the demo telemetry in :mod:`telemetry_reader` so the
+        player and reference traces overlap closely but not exactly, which
+        makes the time delta and the brake-zone cue visible right away.
+        """
+        dist = np.linspace(0.0, lap_length, samples, endpoint=False)
+        # Two braking zones per lap, matching the demo reader's corners.
+        corner = np.minimum(
+            np.abs((dist % (lap_length / 2.0)) - lap_length * 0.2),
+            np.abs((dist % (lap_length / 2.0)) - lap_length * 0.45),
+        )
+        brake = np.clip(100.0 - corner, 0.0, 100.0)
+        throttle = np.clip(100.0 - brake * 1.2, 0.0, 100.0)
+        speed = np.clip(200.0 - brake * 1.5, 40.0, 320.0)
+        steering = 90.0 * np.sin(dist / 120.0)
+        gear = np.clip((speed - 120.0) / 25.0 + 2.0, 1.0, 6.0).astype(np.float64)
+        lap_time_at = np.linspace(0.0, lap_time, samples, endpoint=False)
+        return cls(
+            name=name,
+            lap_dist=dist,
+            speed_kmh=speed,
+            throttle=throttle,
+            brake=brake,
+            gear=gear,
+            steering_deg=steering,
+            lap_time_at=lap_time_at,
+            lap_time=lap_time,
+        )
 
     def brake_zone_ahead(self, lap_dist: float) -> Optional[float]:
         """Distance (metres) to the next brake zone within the look-ahead.
@@ -226,6 +308,11 @@ class ReferenceManager:
             return None
         dist = np.asarray(self._buf["lap_dist"], dtype=np.float64)
         order = np.argsort(dist)
+        raw_time = np.asarray(self._buf["session_time"], dtype=np.float64)[order]
+        if raw_time.size:
+            lap_time_at = raw_time - float(raw_time[0])
+        else:
+            lap_time_at = np.zeros(0, np.float64)
         lap = ReferenceLap(
             name="recorded",
             lap_dist=dist[order],
@@ -234,6 +321,7 @@ class ReferenceManager:
             brake=np.asarray(self._buf["brake"])[order],
             gear=np.asarray(self._buf["gear"])[order],
             steering_deg=np.asarray(self._buf["steering_deg"])[order],
+            lap_time_at=lap_time_at,
             lap_time=float(
                 self._buf["session_time"][-1] - self._lap_start_time
             ) if self._buf["session_time"] else 0.0,
@@ -264,6 +352,7 @@ class ReferenceManager:
             "brake": lap.brake.tolist(),
             "gear": lap.gear.tolist(),
             "steering_deg": lap.steering_deg.tolist(),
+            "lap_time_at": lap.lap_time_at.tolist(),
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
@@ -281,6 +370,7 @@ class ReferenceManager:
             brake=np.asarray(data.get("brake", []), dtype=np.float64),
             gear=np.asarray(data.get("gear", []), dtype=np.float64),
             steering_deg=np.asarray(data.get("steering_deg", []), dtype=np.float64),
+            lap_time_at=np.asarray(data.get("lap_time_at", []), dtype=np.float64),
             lap_time=float(data.get("lap_time", 0.0)),
         )
         self.reference = lap
@@ -311,6 +401,9 @@ class ReferenceManager:
 
         start, end = _last_full_lap(lap_dist)
         sl = slice(start, end)
+        lap_time_at = np.zeros(0, np.float64)
+        if session_time.size >= end and end > start:
+            lap_time_at = session_time[sl] - float(session_time[start])
         lap = ReferenceLap(
             name=os.path.basename(path),
             lap_dist=lap_dist[sl],
@@ -319,6 +412,7 @@ class ReferenceManager:
             brake=brake[sl],
             gear=gear[sl],
             steering_deg=steering[sl],
+            lap_time_at=lap_time_at,
             lap_time=float(session_time[end - 1] - session_time[start])
             if end > start and session_time.size >= end
             else 0.0,
@@ -338,6 +432,12 @@ class ReferenceManager:
             except Exception:
                 return False
         return False
+
+    def load_synthetic(self, **kwargs) -> ReferenceLap:
+        """Install a synthetic reference lap (used by ``--demo``)."""
+        lap = ReferenceLap.synthetic(**kwargs)
+        self.reference = lap
+        return lap
 
 
 def _last_full_lap(lap_dist: np.ndarray):
