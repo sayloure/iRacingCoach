@@ -1,110 +1,154 @@
 import csv
-import sys
+import math
 import os
 
 
 def _find_column(headers, *candidates):
     for c in candidates:
         for h in headers:
-            if h.strip().lower() == c.lower():
+            if h and h.strip().lower() == c.lower():
                 return h.strip()
     return None
+
+
+def _safe_float(val, default=0.0):
+    try:
+        if val is None or val == "":
+            return default
+        return float(str(val).replace(",", "."))
+    except ValueError:
+        return default
 
 
 def load_garage61_csv(csv_path):
     if not os.path.exists(csv_path):
         print(f"Ошибка: файл не найден — {csv_path}")
-        sys.exit(1)
+        return []
 
-    with open(csv_path, newline='') as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            print("Ошибка: файл CSV пуст или не содержит заголовков")
-            sys.exit(1)
+    with open(csv_path, mode="r", encoding="utf-8-sig", newline="") as f:
+        lines = f.readlines()
 
-        headers = reader.fieldnames
-        col_lap = _find_column(headers, 'LapDistPct', 'lapdistpct', 'LapDistPct', 'lap_dist_pct')
-        col_speed = _find_column(headers, 'Speed', 'speed', 'Speed (km/h)', 'Speed (mph)', 'speed_kmh', 'speed_mph')
-        col_brake = _find_column(headers, 'Brake', 'brake')
-        col_throttle = _find_column(headers, 'Throttle', 'throttle')
-        col_steer = _find_column(headers, 'SteeringWheelAngle', 'steeringwheelangle', 'Steer',
-                                 'steering_angle', 'SteeringAngle')
+    # Ищем строку с заголовками (если сверху есть метаданные Garage61)
+    header_idx = 0
+    for idx, line in enumerate(lines[:20]):
+        low = line.lower()
+        if "lapdistpct" in low or ("speed" in low and "throttle" in low):
+            header_idx = idx
+            break
 
-        missing = []
-        if col_lap is None:
-            missing.append('LapDistPct')
-        if col_speed is None:
-            missing.append('Speed')
-        if col_brake is None:
-            missing.append('Brake')
-        if col_throttle is None:
-            missing.append('Throttle')
-        if missing:
-            print(f"Ошибка: не найдены колонки {missing}. Доступные заголовки: {headers}")
-            sys.exit(1)
+    reader = csv.DictReader(lines[header_idx:])
+    if not reader.fieldnames:
+        return []
 
-        rows = []
-        for row in reader:
-            steer_val = float(row[col_steer]) if col_steer else 0.0
-            rows.append({
-                'LapDistPct': float(row[col_lap]),
-                'Speed': float(row[col_speed]),
-                'Brake': float(row[col_brake]),
-                'Throttle': float(row[col_throttle]),
-                'SteeringWheelAngle': steer_val,
-            })
+    headers = reader.fieldnames
+    col_lap = _find_column(headers, "LapDistPct", "lap_dist_pct", "DistancePct")
+    col_speed = _find_column(headers, "Speed", "Speed (km/h)", "speed_kmh", "Velocity")
+    col_brake = _find_column(headers, "Brake", "BrakePct")
+    col_throttle = _find_column(headers, "Throttle", "ThrottlePct")
+    col_steer = _find_column(headers, "SteeringWheelAngle", "Steer", "SteeringAngle")
+    col_gear = _find_column(headers, "Gear")
+    col_time = _find_column(headers, "LapCurrentLapTime", "LapTime", "SessionTime", "Time")
+
+    if not col_lap or not col_speed or not col_brake or not col_throttle:
+        print(f"Не найдены основные колонки в {csv_path}. Заголовки: {headers}")
+        return []
+
+    rows = []
+    for row in reader:
+        pct = _safe_float(row.get(col_lap), -1.0)
+        if pct < 0.0:
+            continue
+        rows.append({
+            "LapDistPct": pct,
+            "Speed": _safe_float(row.get(col_speed)),
+            "Brake": _safe_float(row.get(col_brake)),
+            "Throttle": _safe_float(row.get(col_throttle)),
+            "SteeringWheelAngle": _safe_float(row.get(col_steer)) if col_steer else 0.0,
+            "Gear": int(round(_safe_float(row.get(col_gear), 0))) if col_gear else 0,
+            "Time": _safe_float(row.get(col_time), -1.0) if col_time else -1.0,
+        })
 
     if not rows:
-        print("Ошибка: файл CSV пуст")
-        sys.exit(1)
+        return []
 
-    rows.sort(key=lambda r: r['LapDistPct'])
+    # Нормализация единиц измерения
+    max_pct = max(r["LapDistPct"] for r in rows)
+    if max_pct > 1.5:  # если в процентах 0..100
+        for r in rows:
+            r["LapDistPct"] /= 100.0
+
+    max_speed = max(r["Speed"] for r in rows)
+    # В iRacing / Garage61 скорость в м/с (обычно макс < 110 м/с). Переводим в км/ч:
+    if max_speed < 115.0:
+        for r in rows:
+            r["Speed"] *= 3.6
+
+    max_thr = max(r["Throttle"] for r in rows)
+    if max_thr > 1.5:  # если 0..100 -> переводим в 0..1
+        for r in rows:
+            r["Throttle"] /= 100.0
+
+    max_brk = max(r["Brake"] for r in rows)
+    if max_brk > 1.5:  # если 0..100 -> переводим в 0..1
+        for r in rows:
+            r["Brake"] /= 100.0
+
+    max_steer = max(abs(r["SteeringWheelAngle"]) for r in rows)
+    # Если руль в градусах (> 12), переводим в радианы для единого формата с iRacing
+    if max_steer > 12.0:
+        for r in rows:
+            r["SteeringWheelAngle"] = math.radians(r["SteeringWheelAngle"])
+
+    rows.sort(key=lambda r: r["LapDistPct"])
+
+    # Расчёт эталонного времени круга от 0.0 с (для точной Дельты)
+    has_valid_time = all(r["Time"] >= 0 for r in rows) and (rows[-1]["Time"] > rows[0]["Time"])
+    if has_valid_time:
+        t0 = rows[0]["Time"]
+        for r in rows:
+            r["Time"] -= t0
+    else:
+        # Интегрируем время по скорости и дистанции (при стандартной длине круга 4000 м)
+        t_acc = 0.0
+        rows[0]["Time"] = 0.0
+        for i in range(1, len(rows)):
+            dpct = max(0.0, rows[i]["LapDistPct"] - rows[i - 1]["LapDistPct"])
+            v_ms = max(5.0, (rows[i]["Speed"] + rows[i - 1]["Speed"]) * 0.5 / 3.6)
+            t_acc += (dpct * 4000.0) / v_ms
+            rows[i]["Time"] = t_acc
+
     return rows
 
 
 def get_target_state(current_lap_dist, ref_data):
     if not ref_data:
-        return {'Speed': 0, 'Brake': 0, 'Throttle': 0, 'SteeringWheelAngle': 0}
+        return {
+            "Speed": 0.0,
+            "Brake": 0.0,
+            "Throttle": 0.0,
+            "SteeringWheelAngle": 0.0,
+            "Gear": 0,
+            "Time": 0.0,
+            "Index": 0,
+        }
 
-    n = len(ref_data)
-
-    def lap_diff(a, b):
-        raw = abs(a - b)
-        return 1.0 - raw if raw > 0.5 else raw
-
+    # Быстрый поиск ближайшей точки на кольце 0.0 .. 1.0
     best = 0
-    best_dist = float('inf')
-    for i in range(n):
-        d = lap_diff(current_lap_dist, ref_data[i]['LapDistPct'])
+    best_dist = float("inf")
+    for i, r in enumerate(ref_data):
+        raw = abs(current_lap_dist - r["LapDistPct"])
+        d = 1.0 - raw if raw > 0.5 else raw
         if d < best_dist:
             best_dist = d
             best = i
 
+    pt = ref_data[best]
     return {
-        'Speed': ref_data[best]['Speed'],
-        'Brake': ref_data[best]['Brake'],
-        'Throttle': ref_data[best]['Throttle'],
-        'SteeringWheelAngle': ref_data[best]['SteeringWheelAngle'],
+        "Speed": pt["Speed"],
+        "Brake": pt["Brake"],
+        "Throttle": pt["Throttle"],
+        "SteeringWheelAngle": pt["SteeringWheelAngle"],
+        "Gear": pt.get("Gear", 0),
+        "Time": pt.get("Time", 0.0),
+        "Index": best,
     }
-
-
-if __name__ == '__main__':
-    csv_path = os.path.join(os.path.dirname(__file__), 'reference.csv')
-
-    if not os.path.exists(csv_path):
-        print(f"Тест пропущен: файл {csv_path} не найден")
-        sys.exit(0)
-
-    ref = load_garage61_csv(csv_path)
-    print(f"Загружено {len(ref)} строк")
-    print("Первые 5 строк:")
-    for r in ref[:5]:
-        print(f"  LapDistPct={r['LapDistPct']:.4f}  Speed={r['Speed']:.1f}  "
-              f"Brake={r['Brake']:.3f}  Throttle={r['Throttle']:.3f}")
-
-    for pct in [0.25, 0.5, 0.75]:
-        target = get_target_state(pct, ref)
-        print(f"\nget_target_state({pct}):")
-        print(f"  Speed={target['Speed']:.1f}, Brake={target['Brake']:.3f}, "
-              f"Throttle={target['Throttle']:.3f}, "
-              f"Steer={target['SteeringWheelAngle']:.3f}")
