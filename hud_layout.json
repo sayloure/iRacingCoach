@@ -1,10 +1,12 @@
 {
   "graph": {
-    "x": 2651,
-    "y": 107,
+    "x": 2358,
+    "y": 314,
     "w": 460,
     "h": 230,
-    "enabled": true
+    "enabled": true,
+    "bg_opacity": 80,
+    "fg_opacity": 100
   },
   "banner": {
     "x": 1506,
@@ -16,30 +18,36 @@
     "fg_opacity": 100
   },
   "steer": {
-    "x": 1375,
-    "y": 619,
-    "w": 380,
-    "h": 290,
+    "x": 1187,
+    "y": 677,
+    "w": 1029,
+    "h": 518,
     "enabled": true,
     "bg_opacity": 0,
     "fg_opacity": 100
   },
   "delta": {
-    "x": 786,
-    "y": 26,
+    "x": 590,
+    "y": 294,
     "w": 250,
     "h": 145,
-    "enabled": true
+    "enabled": true,
+    "bg_opacity": 80,
+    "fg_opacity": 100
   },
   "pedals": {
-    "x": 808,
-    "y": 179,
+    "x": 584,
+    "y": 502,
     "w": 210,
     "h": 260,
-    "enabled": true
+    "enabled": true,
+    "bg_opacity": 80,
+    "fg_opacity": 100
   },
   "_options": {
     "show_clutch": true,
-    "warn_lead_sec": 8.0
+    "warn_lead_sec": 8.0,
+    "lock_vk": 119,
+    "hide_vk": 120
   }
 }
