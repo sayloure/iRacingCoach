@@ -13,7 +13,7 @@ except ImportError:
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QCheckBox, QFileDialog, QFrame
+    QLabel, QPushButton, QCheckBox, QFileDialog, QFrame, QSlider
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF
 from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QBrush, QPainterPath, QPolygonF
@@ -33,15 +33,21 @@ class TelemetryState:
         self.speed_kmh = 0.0
         self.throttle = 0.0
         self.brake = 0.0
+        self.clutch = 0.0
         self.steer_rad = 0.0
         self.gear = 0
         self.lap_time = 0.0
         self.track_len = 4500.0
 
+        # Настройки отображения
+        self.show_clutch = False
+        self.warn_lead_sec = 5.0  # За сколько секунд предупреждать о торможении
+
         # Эталон в текущей точке
         self.t_speed = 0.0
         self.t_throttle = 0.0
         self.t_brake = 0.0
+        self.t_clutch = 0.0
         self.t_steer_rad = 0.0
         self.t_gear = 0
         self.t_time = 0.0
@@ -52,17 +58,17 @@ class TelemetryState:
         self.delta_speed = 0.0
         self.brake_in_sec = None
         self.brake_dist_m = None
-        self.banner_mode = ""  # "BRAKE_NOW", "BRAKE_SOON", "THROTTLE", ""
+        self.banner_mode = ""  # "BRAKE_NOW", "BRAKE_SOON", "BRAKE_PREP", "THROTTLE", ""
 
         self.ref_data = []
-        self.brake_zones = []  # индексы точек НАЧАЛА торможения в эталоне
-        self.player_trace = deque(maxlen=250)
+        self.brake_zones = []
+        self.player_trace = deque(maxlen=250)  # (lap_pct, throttle, brake, clutch)
         self.delta_history = deque(maxlen=120)
 
 
 class DraggableHUDWidget(QWidget):
-    """Базовый прозрачный виджет поверх игры с поддержкой перетаскивания и F8 (клики сквозь)."""
-    def __init__(self, key_name, title, default_rect, state, layout_cfg):
+    """Прозрачный виджет поверх игры с индивидуальной прозрачностью фона и самого оверлея."""
+    def __init__(self, key_name, title, default_rect, state, layout_cfg, default_bg_pct=75):
         super().__init__()
         self.key_name = key_name
         self.hud_title = title
@@ -83,13 +89,34 @@ class DraggableHUDWidget(QWidget):
         y = saved.get("y", default_rect[1])
         w = saved.get("w", default_rect[2])
         h = saved.get("h", default_rect[3])
+        self.bg_opacity_pct = saved.get("bg_opacity", default_bg_pct)       # 0..100%
+        self.fg_opacity_pct = saved.get("fg_opacity", 100)                  # 10..100%
         self.setGeometry(x, y, w, h)
+
+    def set_bg_opacity(self, pct: int):
+        self.bg_opacity_pct = max(0, min(100, int(pct)))
+        self._save_state()
+        self.update()
+
+    def set_fg_opacity(self, pct: int):
+        self.fg_opacity_pct = max(10, min(100, int(pct)))
+        self._save_state()
+        self.update()
 
     def set_locked(self, locked: bool):
         self.locked = locked
         self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, locked)
         self.show()
         self.update()
+
+    def _save_state(self):
+        self.layout_cfg[self.key_name] = {
+            "x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(),
+            "enabled": self.isVisible(),
+            "bg_opacity": self.bg_opacity_pct,
+            "fg_opacity": self.fg_opacity_pct,
+        }
+        save_config(self.layout_cfg)
 
     def mousePressEvent(self, event):
         if not self.locked and event.button() == Qt.MouseButton.LeftButton:
@@ -103,97 +130,113 @@ class DraggableHUDWidget(QWidget):
     def mouseReleaseEvent(self, event):
         if self._drag_pos is not None:
             self._drag_pos = None
-            self.layout_cfg[self.key_name] = {
-                "x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(),
-                "enabled": self.isVisible()
-            }
-            save_config(self.layout_cfg)
+            self._save_state()
 
-    def draw_card_bg(self, p: QPainter, alpha=190):
+    def begin_hud_painter(self) -> QPainter:
+        """Создаёт QPainter с учётом индивидуальной прозрачности оверлея."""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(self.fg_opacity_pct / 100.0)
+        return p
+
+    def draw_card_bg(self, p: QPainter, max_alpha=220):
         path = QPainterPath()
         path.addRoundedRect(QRectF(1, 1, self.width() - 2, self.height() - 2), 10, 10)
-        p.fillPath(path, QColor(14, 18, 24, alpha))
+        alpha = int(max_alpha * (self.bg_opacity_pct / 100.0))
+        if alpha > 0:
+            p.fillPath(path, QColor(14, 18, 24, alpha))
+
         if not self.locked:
-            p.setPen(QPen(QColor(0, 210, 255, 180), 1.5, Qt.PenStyle.DashLine))
+            p.setPen(QPen(QColor(0, 210, 255, 190), 1.5, Qt.PenStyle.DashLine))
             p.drawPath(path)
             p.setFont(QFont(FONT_UI, 8, QFont.Weight.Bold))
             p.setPen(QColor(0, 210, 255, 220))
             p.drawText(8, 14, f"✥ {self.hud_title} (тащи мышкой)")
-        else:
-            p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        elif alpha > 15:
+            p.setPen(QPen(QColor(255, 255, 255, int(40 * (self.bg_opacity_pct / 100.0))), 1))
             p.drawPath(path)
 
 
 # ================= 1. ЦЕНТРАЛЬНЫЙ БАННЕР ТОРМОЖЕНИЯ =================
 class BrakeBannerWidget(DraggableHUDWidget):
     def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p = self.begin_hud_painter()
         w, h = self.width(), self.height()
 
         mode = self.state.banner_mode
         if not self.state.connected or (not mode and self.locked):
             if not self.locked:
-                self.draw_card_bg(p, 150)
+                self.draw_card_bg(p, 180)
                 p.setPen(QColor(180, 190, 200))
-                p.setFont(QFont(FONT_UI, 12, QFont.Weight.Bold))
-                p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "BRAKE BANNER (в ожидании зоны торможения)")
+                p.setFont(QFont(FONT_UI, 11, QFont.Weight.Bold))
+                p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "БАННЕР ТОРМОЖЕНИЯ (ожидание зоны)")
             return
 
         path = QPainterPath()
         path.addRoundedRect(QRectF(2, 2, w - 4, h - 4), 10, 10)
+        bg_scale = self.bg_opacity_pct / 100.0
+        lead_max = max(2.0, self.state.warn_lead_sec)
 
         if mode == "BRAKE_NOW":
-            bg = QColor(200, 20, 30, 235)
+            bg = QColor(205, 20, 30, int(240 * bg_scale))
             border = QColor(255, 90, 90)
             title = "[!]   ТОРМОЗИ!   [!]"
             ref_b = self.state.t_brake * 100.0
             you_b = self.state.brake * 100.0
             sub = f"ЦЕЛЬ ТОРМОЗА: {ref_b:.0f}%   (ТЫ: {you_b:.0f}%)"
             pct = max(0.05, min(1.0, self.state.t_brake))
+            bar_col = QColor(255, 220, 60)
         elif mode == "BRAKE_SOON":
             sec = self.state.brake_in_sec or 0.0
             dist = self.state.brake_dist_m or 0.0
-            bg = QColor(45, 22, 12, 220)
-            border = QColor(255, 150, 40)
+            bg = QColor(55, 24, 12, int(225 * bg_scale))
+            border = QColor(255, 145, 35)
             title = f"ТОРМОЗ ЧЕРЕЗ {sec:.1f} с"
             sub = f"ДИСТАНЦИЯ: {dist:.0f} м"
-            pct = max(0.0, min(1.0, 1.0 - (sec / 3.2)))
+            pct = max(0.0, min(1.0, 1.0 - (sec / lead_max)))
+            bar_col = QColor(255, 150, 35)
+        elif mode == "BRAKE_PREP":
+            sec = self.state.brake_in_sec or 0.0
+            dist = self.state.brake_dist_m or 0.0
+            bg = QColor(18, 32, 48, int(215 * bg_scale))
+            border = QColor(0, 200, 255)
+            title = f"ГОТОВЬСЯ К ТОРМОЗУ: {sec:.1f} с"
+            sub = f"ДО ТОЧКИ ТОРМОЖЕНИЯ: {dist:.0f} м"
+            pct = max(0.05, min(1.0, 1.0 - (sec / lead_max)))
+            bar_col = QColor(0, 205, 255)
         elif mode == "THROTTLE":
-            bg = QColor(18, 95, 45, 205)
+            bg = QColor(18, 95, 45, int(210 * bg_scale))
             border = QColor(60, 255, 120)
             title = "ПОЛНЫЙ ГАЗ"
             sub = "ВЫХОД ИЗ ПОВОРОТА"
             pct = 1.0
+            bar_col = QColor(60, 255, 120)
         else:
-            self.draw_card_bg(p, 140)
+            self.draw_card_bg(p, 160)
             return
 
-        p.fillPath(path, bg)
-        p.setPen(QPen(border, 2.2))
-        p.drawPath(path)
+        if bg.alpha() > 0:
+            p.fillPath(path, bg)
+        if bg_scale > 0.05 or not self.locked:
+            p.setPen(QPen(border, 2.2))
+            p.drawPath(path)
 
-        # Главный текст
         p.setPen(Qt.GlobalColor.white)
-        p.setFont(QFont(FONT_UI, 18, QFont.Weight.Bold))
+        p.setFont(QFont(FONT_UI, 17, QFont.Weight.Bold))
         p.drawText(0, 5, w, 34, Qt.AlignmentFlag.AlignCenter, title)
 
-        # Полоса прогресса / силы торможения
         bar_w = w - 56
         bar_x = 28
         bar_y = 43
         p.fillRect(bar_x, bar_y, bar_w, 11, QColor(0, 0, 0, 150))
         fill_w = int(bar_w * pct)
-        bar_col = QColor(255, 220, 60) if mode == "BRAKE_NOW" else QColor(255, 165, 40) if mode == "BRAKE_SOON" else QColor(60, 255, 120)
         p.fillRect(bar_x, bar_y, fill_w, 11, bar_col)
 
-        # В режиме торможения рисуем отметку твоего нажатия поверх целевой полосы
         if mode == "BRAKE_NOW":
             you_x = bar_x + int(bar_w * max(0.0, min(1.0, self.state.brake)))
             p.setPen(QPen(Qt.GlobalColor.white, 3))
             p.drawLine(you_x, bar_y - 2, you_x, bar_y + 13)
 
-        # Подпись дистанции / процентов
         p.setFont(QFont(FONT_MONO, 10, QFont.Weight.Bold))
         p.setPen(QColor(240, 240, 245))
         p.drawText(0, 56, w, 22, Qt.AlignmentFlag.AlignCenter, sub)
@@ -202,9 +245,8 @@ class BrakeBannerWidget(DraggableHUDWidget):
 # ================= 2. ВИДЖЕТ ДЕЛЬТЫ ВРЕМЕНИ =================
 class DeltaWidget(DraggableHUDWidget):
     def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.draw_card_bg(p, 200)
+        p = self.begin_hud_painter()
+        self.draw_card_bg(p, 210)
         w, h = self.width(), self.height()
 
         p.setFont(QFont(FONT_UI, 9, QFont.Weight.Bold))
@@ -230,9 +272,10 @@ class DeltaWidget(DraggableHUDWidget):
 
         gx, gy, gw, gh = 12, 86, w - 24, h - 96
         if gh > 15:
-            p.fillRect(gx, gy, gw, gh, QColor(8, 10, 14, 150))
+            if self.bg_opacity_pct > 10:
+                p.fillRect(gx, gy, gw, gh, QColor(8, 10, 14, int(150 * (self.bg_opacity_pct / 100.0))))
             mid_y = gy + gh // 2
-            p.setPen(QPen(QColor(255, 255, 255, 40), 1, Qt.PenStyle.DashLine))
+            p.setPen(QPen(QColor(255, 255, 255, 45), 1, Qt.PenStyle.DashLine))
             p.drawLine(gx, mid_y, gx + gw, mid_y)
 
             hist = list(self.state.delta_history)
@@ -248,12 +291,11 @@ class DeltaWidget(DraggableHUDWidget):
                     p.drawLine(x1, y1, x2, y2)
 
 
-# ================= 3. ОТДЕЛЬНЫЙ ВИДЖЕТ ПЕДАЛЕЙ (СОВМЕЩЁННЫЕ ШКАЛЫ) =================
+# ================= 3. ОТДЕЛЬНЫЙ ВИДЖЕТ ПЕДАЛЕЙ =================
 class PedalsWidget(DraggableHUDWidget):
     def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.draw_card_bg(p, 200)
+        p = self.begin_hud_painter()
+        self.draw_card_bg(p, 210)
         w, h = self.width(), self.height()
 
         p.setFont(QFont(FONT_UI, 9, QFont.Weight.Bold))
@@ -264,98 +306,118 @@ class PedalsWidget(DraggableHUDWidget):
         bot_y = h - 24
         bar_h = max(20, bot_y - top_y)
 
-        draw_unified_pedal_bar(
-            p, x_center=w // 4 + 4, top_y=top_y, bar_w=38, bar_h=bar_h,
-            you_val=self.state.brake, ref_val=self.state.t_brake,
-            label="BRAKE", main_col=QColor(255, 50, 60), ref_col=QColor(255, 160, 40)
-        )
-        draw_unified_pedal_bar(
-            p, x_center=(w * 3) // 4 - 4, top_y=top_y, bar_w=38, bar_h=bar_h,
-            you_val=self.state.throttle, ref_val=self.state.t_throttle,
-            label="THROTTLE", main_col=QColor(45, 245, 95), ref_col=QColor(180, 255, 200)
-        )
+        if self.state.show_clutch:
+            draw_unified_pedal_bar(
+                p, x_center=w // 6 + 4, top_y=top_y, bar_w=28, bar_h=bar_h,
+                you_val=self.state.clutch, ref_val=self.state.t_clutch,
+                label="CLUTCH", main_col=QColor(0, 195, 255), ref_col=QColor(140, 235, 255)
+            )
+            draw_unified_pedal_bar(
+                p, x_center=w // 2, top_y=top_y, bar_w=28, bar_h=bar_h,
+                you_val=self.state.brake, ref_val=self.state.t_brake,
+                label="BRAKE", main_col=QColor(255, 50, 60), ref_col=QColor(255, 160, 40)
+            )
+            draw_unified_pedal_bar(
+                p, x_center=(w * 5) // 6 - 4, top_y=top_y, bar_w=28, bar_h=bar_h,
+                you_val=self.state.throttle, ref_val=self.state.t_throttle,
+                label="THROTTLE", main_col=QColor(45, 245, 95), ref_col=QColor(180, 255, 200)
+            )
+        else:
+            draw_unified_pedal_bar(
+                p, x_center=w // 4 + 4, top_y=top_y, bar_w=38, bar_h=bar_h,
+                you_val=self.state.brake, ref_val=self.state.t_brake,
+                label="BRAKE", main_col=QColor(255, 50, 60), ref_col=QColor(255, 160, 40)
+            )
+            draw_unified_pedal_bar(
+                p, x_center=(w * 3) // 4 - 4, top_y=top_y, bar_w=38, bar_h=bar_h,
+                you_val=self.state.throttle, ref_val=self.state.t_throttle,
+                label="THROTTLE", main_col=QColor(45, 245, 95), ref_col=QColor(180, 255, 200)
+            )
 
 
 def draw_unified_pedal_bar(p: QPainter, x_center: int, top_y: int, bar_w: int, bar_h: int,
                            you_val: float, ref_val: float, label: str, main_col: QColor, ref_col: QColor):
-    """
-    Рисует объединённый столбик педали:
-    - полупрозрачная заливка — целевой уровень ЭТАЛОНА (REF) + яркая горизонтальная планка-мишень;
-    - внутренняя яркая колонка — нажатие ИГРОКА (YOU).
-    """
     x0 = x_center - bar_w // 2
     you_v = max(0.0, min(1.0, you_val))
     ref_v = max(0.0, min(1.0, ref_val))
 
-    # Цифры YOU / REF сверху
-    p.setFont(QFont(FONT_MONO, 9, QFont.Weight.Bold))
+    p.setFont(QFont(FONT_MONO, 8 if bar_w < 28 else 9, QFont.Weight.Bold))
     p.setPen(Qt.GlobalColor.white)
-    p.drawText(x_center - 48, top_y - 20, 96, 16, Qt.AlignmentFlag.AlignCenter,
-               f"{you_v * 100:.0f}% / {ref_v * 100:.0f}%")
+    p.drawText(x_center - 44, top_y - 20, 88, 16, Qt.AlignmentFlag.AlignCenter,
+               f"{you_v * 100:.0f}/{ref_v * 100:.0f}%")
 
-    # Фон стакана
-    p.fillRect(x0, top_y, bar_w, bar_h, QColor(18, 22, 30, 220))
+    p.fillRect(x0, top_y, bar_w, bar_h, QColor(14, 18, 25, 190))
 
-    # 1. Заливка ЭТАЛОНА (на всю ширину стакана, полупрозрачная)
     rh = int(bar_h * ref_v)
     ref_fill = QColor(main_col.red(), main_col.green(), main_col.blue(), 65)
     p.fillRect(x0 + 1, top_y + bar_h - rh, bar_w - 2, rh, ref_fill)
 
-    # 2. Заливка ИГРОКА (чуть уже стакана, яркая)
     yh = int(bar_h * you_v)
-    pad = 5
+    pad = max(3, bar_w // 6)
     p.fillRect(x0 + pad, top_y + bar_h - yh, bar_w - pad * 2, yh, main_col)
 
-    # 3. Яркая горизонтальная ПЛАНКА-МИШЕНЬ эталона (куда нужно попасть!)
     if ref_v > 0.02:
         ry = top_y + bar_h - rh
         p.setPen(QPen(Qt.GlobalColor.white, 3))
-        p.drawLine(x0 - 3, ry, x0 + bar_w + 3, ry)
+        p.drawLine(x0 - 2, ry, x0 + bar_w + 2, ry)
         p.setPen(QPen(ref_col, 1.5))
-        p.drawLine(x0 - 3, ry - 2, x0 + bar_w + 3, ry - 2)
+        p.drawLine(x0 - 2, ry - 2, x0 + bar_w + 2, ry - 2)
 
-    # Контур стакана (светится зелёным/голубым, если игрок точно попал в эталон)
     diff = abs(you_v - ref_v)
-    border_col = QColor(0, 240, 180, 220) if (ref_v > 0.1 and diff < 0.08) else QColor(90, 105, 125, 180)
+    border_col = QColor(0, 240, 180, 220) if (ref_v > 0.1 and diff < 0.08) else QColor(90, 105, 125, 170)
     p.setPen(QPen(border_col, 1.5))
     p.drawRect(x0, top_y, bar_w, bar_h)
 
-    # Подпись снизу
-    p.setFont(QFont(FONT_UI, 8, QFont.Weight.Bold))
+    p.setFont(QFont(FONT_UI, 7 if bar_w < 26 else 8, QFont.Weight.Bold))
     p.setPen(QColor(195, 205, 220))
-    p.drawText(x_center - 45, top_y + bar_h + 4, 90, 16, Qt.AlignmentFlag.AlignCenter, label)
+    p.drawText(x_center - 40, top_y + bar_h + 4, 80, 16, Qt.AlignmentFlag.AlignCenter, label)
 
 
-# ================= 4. ГЛАВНЫЙ КОКПИТ-ВИДЖЕТ: 3D-ТРАЕКТОРИЯ + РУЛЬ + ПЕДАЛИ + ПЕРЕДАЧА =================
+# ================= 4. ГЛАВНЫЙ КОКПИТ-ВИДЖЕТ (3D-ТРАЕКТОРИЯ + РУЛЬ + ПЕДАЛИ + ПЕРЕДАЧА) =================
 class SteerGearRibbonWidget(DraggableHUDWidget):
     def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.draw_card_bg(p, 175)
+        p = self.begin_hud_painter()
+        # По умолчанию у центрального кокпита bg_opacity = 0% (полностью прозрачный фон!)
+        self.draw_card_bg(p, 200)
         w, h = self.width(), self.height()
 
-        # Встроенные совмещённые столбики ТОРМОЗА (слева) и ГАЗА (справа) прямо внутри виджета!
         pedal_top = 42
         pedal_h = h - 68
-        draw_unified_pedal_bar(
-            p, x_center=38, top_y=pedal_top, bar_w=30, bar_h=pedal_h,
-            you_val=self.state.brake, ref_val=self.state.t_brake,
-            label="ТОРМОЗ", main_col=QColor(255, 50, 60), ref_col=QColor(255, 200, 50)
-        )
+
+        # Если включено Сцепление — слева рисуем два аккуратных столбика (СЦЕПЛ и ТОРМОЗ), иначе один широкий ТОРМОЗ
+        if self.state.show_clutch:
+            draw_unified_pedal_bar(
+                p, x_center=24, top_y=pedal_top, bar_w=20, bar_h=pedal_h,
+                you_val=self.state.clutch, ref_val=self.state.t_clutch,
+                label="СЦЕПЛ", main_col=QColor(0, 195, 255), ref_col=QColor(150, 235, 255)
+            )
+            draw_unified_pedal_bar(
+                p, x_center=62, top_y=pedal_top, bar_w=24, bar_h=pedal_h,
+                you_val=self.state.brake, ref_val=self.state.t_brake,
+                label="ТОРМ", main_col=QColor(255, 50, 60), ref_col=QColor(255, 200, 50)
+            )
+            center_left = 88
+        else:
+            draw_unified_pedal_bar(
+                p, x_center=38, top_y=pedal_top, bar_w=30, bar_h=pedal_h,
+                you_val=self.state.brake, ref_val=self.state.t_brake,
+                label="ТОРМОЗ", main_col=QColor(255, 50, 60), ref_col=QColor(255, 200, 50)
+            )
+            center_left = 76
+
+        # Справа столбик ГАЗА
         draw_unified_pedal_bar(
             p, x_center=w - 38, top_y=pedal_top, bar_w=30, bar_h=pedal_h,
             you_val=self.state.throttle, ref_val=self.state.t_throttle,
             label="ГАЗ", main_col=QColor(45, 245, 95), ref_col=QColor(180, 255, 200)
         )
 
-        # Центральная зона для 3D-дорожки и руля (между двумя педалями)
-        center_left = 76
-        center_w = w - 152
+        center_w = w - center_left - 76
 
-        # 1. Рисуем 3D-ленту траектории впереди с шевронами дистанции и маркерами передач
+        # 1. 3D-лента траектории
         self._draw_trajectory_ribbon(p, center_left, center_w, int(h * 0.54))
 
-        # 2. Дуга угла руля (ACTUAL vs BENCHMARK)
+        # 2. Дуга угла руля
         arc_w = min(230, center_w - 16)
         arc_h = 88
         arc_x = center_left + (center_w - arc_w) // 2
@@ -369,35 +431,27 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         p.setPen(QPen(QColor(55, 65, 75, 160), 4))
         p.drawArc(rect_inner, 0 * 16, 180 * 16)
 
-        # ВАЖНО: В iRacing SteeringWheelAngle > 0 — это поворот ВЛЕВО, а < 0 — ВПРАВО.
-        # Инвертируем знак (-math.degrees), чтобы поворот руля вправо давал "+" и двигал ползунок ВПРАВО!
         you_deg = -math.degrees(self.state.steer_rad)
         ref_deg = -math.degrees(self.state.t_steer_rad)
 
         def deg_to_qt_angle(deg_right_positive):
             clamped = max(-180.0, min(180.0, deg_right_positive))
-            # В Qt 90° = 12 часов (верх), 0° = 3 часа (право), 180° = 9 часов (лево).
-            # Поэтому положительный угол (вправо) уменьшает угол от 90° к 0°:
             return int((90.0 - clamped * 0.45) * 16)
 
-        # Центральная засечка "0 градусов" на 12 часах
-        p.setPen(QPen(QColor(255, 255, 255, 120), 2))
+        p.setPen(QPen(QColor(255, 255, 255, 130), 2))
         cx_arc = arc_x + arc_w // 2
         p.drawLine(cx_arc, arc_y - 4, cx_arc, arc_y + 14)
 
-        # Метка REF (внутренняя оранжевая дуга)
         ref_ang = deg_to_qt_angle(ref_deg)
         p.setPen(QPen(QColor(255, 165, 45), 6))
         p.drawArc(rect_inner, ref_ang - 6 * 16, 12 * 16)
 
-        # Метка YOU (внешняя голубая дуга)
         you_ang = deg_to_qt_angle(you_deg)
         diff = abs(you_deg - ref_deg)
         you_col = QColor(40, 225, 255) if diff < 12 else QColor(255, 75, 75)
         p.setPen(QPen(you_col, 7))
         p.drawArc(rect_outer, you_ang - 6 * 16, 12 * 16)
 
-        # Подписи градусов руля (ACTUAL слева, REF справа)
         p.setFont(QFont(FONT_UI, 8, QFont.Weight.Bold))
         p.setPen(you_col)
         p.drawText(center_left + 4, arc_y + 2, 85, 14, Qt.AlignmentFlag.AlignLeft, "ТЫ (РУЛЬ)")
@@ -410,7 +464,7 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         p.setFont(QFont(FONT_MONO, 13, QFont.Weight.Bold))
         p.drawText(center_left + center_w - 89, arc_y + 16, 85, 22, Qt.AlignmentFlag.AlignRight, f"{ref_deg:+.0f}°")
 
-        # 3. Блок GEAR COACH и СКОРОСТИ под дугой
+        # 3. Блок GEAR COACH и СКОРОСТИ
         gear_y = h - 66
         g_you = self.state.gear
         g_ref = self.state.t_gear
@@ -429,7 +483,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         p.setPen(g_col)
         p.drawText(center_left, gear_y, center_w, 28, Qt.AlignmentFlag.AlignCenter, g_text)
 
-        # Скорость и дельта скорости в точке
         spd_col = QColor(60, 255, 120) if self.state.delta_speed >= -2 else QColor(255, 180, 60)
         p.setFont(QFont(FONT_MONO, 12, QFont.Weight.Bold))
         p.setPen(spd_col)
@@ -437,12 +490,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
                    f"{self.state.speed_kmh:.0f} км/ч  (эталон: {self.state.t_speed:.0f})")
 
     def _draw_trajectory_ribbon(self, p: QPainter, x_offset: int, w_zone: int, h_zone: int):
-        """
-        Уходящая в перспективу 3D-дорожка эталона на следующие ~160 метров:
-        - изгибается ВПРАВО, когда руль эталона повёрнут вправо, и ВЛЕВО — когда влево;
-        - ширина центральной заливки пропорциональна нажатию педали эталона;
-        - рисует шевроны дистанции (50м, 100м, 150м) и точки переключения передач на траектории.
-        """
         ref = self.state.ref_data
         if not ref:
             return
@@ -450,7 +497,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         n = len(ref)
         idx0 = self.state.ref_idx
         steps = 22
-        # Берём ~160 метров вперёд по трассе
         lookahead_pct = min(0.06, 160.0 / max(1000.0, self.state.track_len))
         step_stride = max(1, int((n * lookahead_pct) / steps))
 
@@ -470,15 +516,12 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         for s in range(steps):
             pt = ref[(idx0 + s * step_stride) % n]
             t = s / float(steps - 1)
-            # Перспективное сжатие по высоте (ближе к нам шаги крупнее, вдали — плотнее)
             persp_t = math.pow(t, 0.82)
             y = bottom_y - persp_t * (bottom_y - top_y)
 
-            # ИСПРАВЛЕНО: В iRacing отрицательный угол руля = поворот ВПРАВО -> смещаем дорожку ВПРАВО (+x)
             steer_right_deg = -math.degrees(pt["SteeringWheelAngle"])
             slope += (steer_right_deg / 90.0) * 3.8
             curve_x += slope * (0.35 + 0.65 * t)
-            # Ограничиваем вылет дорожки за края зоны
             max_offset = w_zone * 0.36
             curve_x = max(-max_offset, min(max_offset, curve_x))
 
@@ -495,18 +538,15 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
 
             seg_data.append((brk, thr, t, half_w, gear_change))
 
-        # Отрисовка сегментов дорожки от ближних к дальним
         for s in range(steps - 1):
             brk, thr, t, half_w, _ = seg_data[s]
             alpha = int(215 * (1.0 - t * 0.45))
 
-            # Базовое полотно асфальта
             poly_road = QPolygonF([pts_left[s], pts_right[s], pts_right[s + 1], pts_left[s + 1]])
             p.setBrush(QBrush(QColor(25, 32, 42, int(alpha * 0.7))))
             p.setPen(QPen(QColor(120, 140, 165, int(alpha * 0.6)), 1))
             p.drawPolygon(poly_road)
 
-            # Активная цветовая полоса внутри дорожки (ширина показывает силу нажатия тормоза/газа!)
             if brk > 0.08:
                 col = QColor(255, 45, 55, alpha) if brk > 0.35 else QColor(255, 165, 30, alpha)
                 intensity = max(0.25, min(1.0, brk))
@@ -530,7 +570,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.drawPolygon(poly_active)
 
-            # Дистанционные метки 50м / 100м и маркеры переключения передач на траектории
             if s in (6, 13):
                 dist_label = "50m" if s == 6 else "100m"
                 p.setPen(QPen(QColor(255, 255, 255, 130), 1, Qt.PenStyle.DashLine))
@@ -539,7 +578,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
                 p.setPen(QColor(210, 220, 235, 180))
                 p.drawText(int(pts_right[s].x() + 4), int(pts_right[s].y() + 3), dist_label)
 
-        # Рисуем значки переключения передачи прямо поверх 3D-дорожки в месте переключения
         for s in range(1, steps - 1):
             gear_change = seg_data[s][4]
             if gear_change > 0:
@@ -548,15 +586,14 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
                 p.setPen(QColor(255, 230, 80))
                 p.drawText(int(cpt.x() - 28), int(cpt.y() - 8), 56, 16,
                            Qt.AlignmentFlag.AlignCenter, f"GEAR {gear_change}")
-                break  # Показываем только ближайшее переключение
+                break
 
 
 # ================= 5. ЖИВОЙ ГРАФИК ПО ДИСТАНЦИИ =================
 class TelemetryGraphWidget(DraggableHUDWidget):
     def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.draw_card_bg(p, 205)
+        p = self.begin_hud_painter()
+        self.draw_card_bg(p, 210)
         w, h = self.width(), self.height()
 
         p.setFont(QFont(FONT_UI, 9, QFont.Weight.Bold))
@@ -566,9 +603,10 @@ class TelemetryGraphWidget(DraggableHUDWidget):
 
         gx, gy = 10, 26
         gw, gh = w - 20, h - 34
-        p.fillRect(gx, gy, gw, gh, QColor(8, 11, 16, 190))
+        if self.bg_opacity_pct > 5:
+            p.fillRect(gx, gy, gw, gh, QColor(8, 11, 16, int(190 * (self.bg_opacity_pct / 100.0))))
 
-        p.setPen(QPen(QColor(255, 255, 255, 22), 1))
+        p.setPen(QPen(QColor(255, 255, 255, 25), 1))
         for k in (0.25, 0.5, 0.75):
             yy = int(gy + gh * k)
             p.drawLine(gx, yy, gx + gw, yy)
@@ -597,13 +635,14 @@ class TelemetryGraphWidget(DraggableHUDWidget):
 
         ref = self.state.ref_data
         if ref:
-            pts_thr = []
-            pts_brk = []
+            pts_thr, pts_brk, pts_cl = [], [], []
             for r in ref:
                 rd = rel_pct(r["LapDistPct"])
                 if -win_back <= rd <= win_ahead:
                     pts_thr.append((rd, r["Throttle"]))
                     pts_brk.append((rd, r["Brake"]))
+                    if self.state.show_clutch:
+                        pts_cl.append((rd, r.get("Clutch", 0.0)))
 
             pts_thr.sort(key=lambda item: item[0])
             pts_brk.sort(key=lambda item: item[0])
@@ -611,36 +650,40 @@ class TelemetryGraphWidget(DraggableHUDWidget):
             p.setPen(QPen(QColor(50, 255, 100, 130), 1.5, Qt.PenStyle.DotLine))
             for i in range(len(pts_thr) - 1):
                 if pts_thr[i + 1][0] - pts_thr[i][0] < 0.03:
-                    x1, y1 = to_xy(*pts_thr[i])
-                    x2, y2 = to_xy(*pts_thr[i + 1])
-                    p.drawLine(x1, y1, x2, y2)
+                    p.drawLine(*to_xy(*pts_thr[i]), *to_xy(*pts_thr[i + 1]))
 
             p.setPen(QPen(QColor(255, 70, 75, 160), 1.8, Qt.PenStyle.DotLine))
             for i in range(len(pts_brk) - 1):
                 if pts_brk[i + 1][0] - pts_brk[i][0] < 0.03:
-                    x1, y1 = to_xy(*pts_brk[i])
-                    x2, y2 = to_xy(*pts_brk[i + 1])
-                    p.drawLine(x1, y1, x2, y2)
+                    p.drawLine(*to_xy(*pts_brk[i]), *to_xy(*pts_brk[i + 1]))
+
+            if self.state.show_clutch and pts_cl:
+                pts_cl.sort(key=lambda item: item[0])
+                p.setPen(QPen(QColor(0, 195, 255, 130), 1.4, Qt.PenStyle.DotLine))
+                for i in range(len(pts_cl) - 1):
+                    if pts_cl[i + 1][0] - pts_cl[i][0] < 0.03:
+                        p.drawLine(*to_xy(*pts_cl[i]), *to_xy(*pts_cl[i + 1]))
 
         trace = list(self.state.player_trace)
         if len(trace) > 2:
             p.setPen(QPen(QColor(45, 255, 95), 2.4))
             for i in range(len(trace) - 1):
-                rd1 = rel_pct(trace[i][0])
-                rd2 = rel_pct(trace[i + 1][0])
+                rd1, rd2 = rel_pct(trace[i][0]), rel_pct(trace[i + 1][0])
                 if -win_back <= rd1 <= 0.01 and -win_back <= rd2 <= 0.01 and abs(rd2 - rd1) < 0.03:
-                    x1, y1 = to_xy(rd1, trace[i][1])
-                    x2, y2 = to_xy(rd2, trace[i + 1][1])
-                    p.drawLine(x1, y1, x2, y2)
+                    p.drawLine(*to_xy(rd1, trace[i][1]), *to_xy(rd2, trace[i + 1][1]))
 
             p.setPen(QPen(QColor(255, 55, 65), 2.4))
             for i in range(len(trace) - 1):
-                rd1 = rel_pct(trace[i][0])
-                rd2 = rel_pct(trace[i + 1][0])
+                rd1, rd2 = rel_pct(trace[i][0]), rel_pct(trace[i + 1][0])
                 if -win_back <= rd1 <= 0.01 and -win_back <= rd2 <= 0.01 and abs(rd2 - rd1) < 0.03:
-                    x1, y1 = to_xy(rd1, trace[i][2])
-                    x2, y2 = to_xy(rd2, trace[i + 1][2])
-                    p.drawLine(x1, y1, x2, y2)
+                    p.drawLine(*to_xy(rd1, trace[i][2]), *to_xy(rd2, trace[i + 1][2]))
+
+            if self.state.show_clutch:
+                p.setPen(QPen(QColor(0, 195, 255), 2.0))
+                for i in range(len(trace) - 1):
+                    rd1, rd2 = rel_pct(trace[i][0]), rel_pct(trace[i + 1][0])
+                    if -win_back <= rd1 <= 0.01 and -win_back <= rd2 <= 0.01 and abs(rd2 - rd1) < 0.03:
+                        p.drawLine(*to_xy(rd1, trace[i][3]), *to_xy(rd2, trace[i + 1][3]))
 
 
 # ================= ГЛАВНОЕ ОКНО УПРАВЛЕНИЯ (CONTROL PANEL) =================
@@ -648,7 +691,7 @@ class ControlPanelWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("iRacing Coach — Панель управления")
-        self.resize(460, 420)
+        self.resize(580, 620)
         self.setStyleSheet("""
             QMainWindow, QWidget { background-color: #12161f; color: #e4e8f0; font-family: 'Segoe UI'; }
             QPushButton {
@@ -656,8 +699,11 @@ class ControlPanelWindow(QMainWindow):
                 padding: 8px 12px; font-weight: bold; color: #ffffff;
             }
             QPushButton:hover { background-color: #2a364d; border-color: #00d2ff; }
-            QCheckBox { font-size: 13px; spacing: 8px; padding: 4px; }
+            QCheckBox { font-size: 13px; spacing: 8px; padding: 2px; font-weight: bold; }
             QFrame#card { background-color: #181e2a; border: 1px solid #263042; border-radius: 8px; }
+            QSlider::groove:horizontal { height: 6px; background: #263042; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #00d2ff; border-radius: 3px; }
+            QSlider::handle:horizontal { width: 14px; margin: -4px 0; border-radius: 7px; background: #ffffff; }
         """)
 
         self.state = TelemetryState()
@@ -667,12 +713,18 @@ class ControlPanelWindow(QMainWindow):
         self._last_beep_zone = -1
         self._brake_hold_active = False
 
+        # Загружаем глобальные опции из конфига
+        opts = self.layout_cfg.get("_options", {})
+        self.state.show_clutch = bool(opts.get("show_clutch", False))
+        self.state.warn_lead_sec = float(opts.get("warn_lead_sec", 5.0))
+
+        # У центрального кокпита (steer) фон по умолчанию 0% (прозрачный), у остальных 80%
         self.hud_widgets = {
-            "banner": BrakeBannerWidget("banner", "Баннер торможения", (610, 40, 440, 82), self.state, self.layout_cfg),
-            "delta": DeltaWidget("delta", "Дельта времени", (60, 60, 250, 145), self.state, self.layout_cfg),
-            "pedals": PedalsWidget("pedals", "Отдельные Педали", (60, 680, 210, 260), self.state, self.layout_cfg),
-            "steer": SteerGearRibbonWidget("steer", "Кокпит: 3D-Траектория + Руль + Педали", (590, 560, 460, 310), self.state, self.layout_cfg),
-            "graph": TelemetryGraphWidget("graph", "График телеметрии", (1180, 700, 460, 230), self.state, self.layout_cfg),
+            "banner": BrakeBannerWidget("banner", "Баннер торможения", (610, 40, 460, 82), self.state, self.layout_cfg, default_bg_pct=85),
+            "delta": DeltaWidget("delta", "Дельта времени", (60, 60, 250, 145), self.state, self.layout_cfg, default_bg_pct=80),
+            "steer": SteerGearRibbonWidget("steer", "Кокпит: 3D-Траектория + Руль + Педали", (590, 560, 480, 310), self.state, self.layout_cfg, default_bg_pct=0),
+            "pedals": PedalsWidget("pedals", "Отдельные Педали", (60, 680, 220, 260), self.state, self.layout_cfg, default_bg_pct=80),
+            "graph": TelemetryGraphWidget("graph", "График телеметрии", (1180, 700, 460, 230), self.state, self.layout_cfg, default_bg_pct=80),
         }
 
         self._build_ui()
@@ -696,8 +748,9 @@ class ControlPanelWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
+        root.setSpacing(10)
 
+        # 1. Статус-карточка
         status_card = QFrame()
         status_card.setObjectName("card")
         sc_layout = QVBoxLayout(status_card)
@@ -709,6 +762,7 @@ class ControlPanelWindow(QMainWindow):
         sc_layout.addWidget(self.lbl_ref)
         root.addWidget(status_card)
 
+        # 2. Кнопки управления
         btn_row = QHBoxLayout()
         self.btn_load = QPushButton("📂 Загрузить эталон (.csv)")
         self.btn_load.clicked.connect(self.open_file_dialog)
@@ -718,43 +772,121 @@ class ControlPanelWindow(QMainWindow):
         btn_row.addWidget(self.btn_lock)
         root.addLayout(btn_row)
 
+        # 3. Карточка общих настроек тренера (Сцепление + Таймер предупреждения)
+        opt_card = QFrame()
+        opt_card.setObjectName("card")
+        opt_layout = QVBoxLayout(opt_card)
+        lbl_opt = QLabel("Настройки телеметрии и предупреждений:")
+        lbl_opt.setStyleSheet("font-weight: bold; color: #00d2ff;")
+        opt_layout.addWidget(lbl_opt)
+
+        self.cb_clutch = QCheckBox("Показывать педаль Сцепления (CLUTCH) в педалях и на графике")
+        self.cb_clutch.setChecked(self.state.show_clutch)
+        self.cb_clutch.toggled.connect(self._on_clutch_toggled)
+        opt_layout.addWidget(self.cb_clutch)
+
+        lead_row = QHBoxLayout()
+        self.lbl_lead = QLabel(f"Предупреждать о тормозе заранее за: {self.state.warn_lead_sec:.1f} сек")
+        self.lbl_lead.setStyleSheet("font-size: 12px; color: #cbd5e1;")
+        self.sld_lead = QSlider(Qt.Orientation.Horizontal)
+        self.sld_lead.setRange(20, 80)  # 2.0 .. 8.0 сек
+        self.sld_lead.setValue(int(self.state.warn_lead_sec * 10))
+        self.sld_lead.valueChanged.connect(self._on_lead_changed)
+        lead_row.addWidget(self.lbl_lead)
+        lead_row.addWidget(self.sld_lead)
+        opt_layout.addLayout(lead_row)
+        root.addWidget(opt_card)
+
+        # 4. Карточка виджетов и индивидуальной прозрачности (Фон / Оверлей)
         chk_card = QFrame()
         chk_card.setObjectName("card")
         chk_layout = QVBoxLayout(chk_card)
-        lbl_h = QLabel("Отображаемые виджеты на экране:")
+        lbl_h = QLabel("Виджеты и индивидуальная прозрачность (Фон / Весь виджет):")
         lbl_h.setStyleSheet("font-weight: bold; color: #00d2ff; margin-bottom: 4px;")
         chk_layout.addWidget(lbl_h)
 
         self.checkboxes = {}
         titles = {
-            "banner": "Центральный баннер торможения (ТОРМОЗИ + Звук)",
-            "delta": "Виджет Дельты времени и скорости (DELTA)",
-            "steer": "Центральный кокпит (3D-Траектория + Руль + Встроенные педали)",
-            "pedals": "Отдельный блок педалей (можно отключить, т.к. есть в кокпите)",
-            "graph": "Живой график педалей по дистанции (LIVE vs REF)",
+            "banner": "Баннер торможения (BRAKE IN)",
+            "delta": "Виджет Дельты времени (DELTA)",
+            "steer": "Центральный кокпит (Руль + Траектория + Педали)",
+            "pedals": "Отдельный блок педалей",
+            "graph": "Живой график педалей (LIVE vs REF)",
         }
+
         for key, text in titles.items():
+            w = self.hud_widgets[key]
+            block = QVBoxLayout()
+            block.setSpacing(3)
+
             cb = QCheckBox(text)
             cb.setChecked(True)
             cb.toggled.connect(lambda checked, k=key: self.toggle_widget(k, checked))
-            chk_layout.addWidget(cb)
+            block.addWidget(cb)
             self.checkboxes[key] = cb
+
+            sliders_row = QHBoxLayout()
+            sliders_row.setContentsMargins(22, 0, 0, 6)
+
+            # Ползунок прозрачности ФОНА
+            lbl_bg = QLabel(f"Фон: {w.bg_opacity_pct}%")
+            lbl_bg.setFixedWidth(72)
+            lbl_bg.setStyleSheet("font-size: 11px; color: #9aa5b8;")
+            sld_bg = QSlider(Qt.Orientation.Horizontal)
+            sld_bg.setRange(0, 100)
+            sld_bg.setValue(w.bg_opacity_pct)
+            sld_bg.valueChanged.connect(
+                lambda val, widget=w, label=lbl_bg: (label.setText(f"Фон: {val}%"), widget.set_bg_opacity(val))
+            )
+
+            # Ползунок прозрачности ОВЕРЛЕЯ целиком
+            lbl_fg = QLabel(f"Оверлей: {w.fg_opacity_pct}%")
+            lbl_fg.setFixedWidth(92)
+            lbl_fg.setStyleSheet("font-size: 11px; color: #9aa5b8; margin-left: 8px;")
+            sld_fg = QSlider(Qt.Orientation.Horizontal)
+            sld_fg.setRange(15, 100)
+            sld_fg.setValue(w.fg_opacity_pct)
+            sld_fg.valueChanged.connect(
+                lambda val, widget=w, label=lbl_fg: (label.setText(f"Оверлей: {val}%"), widget.set_fg_opacity(val))
+            )
+
+            sliders_row.addWidget(lbl_bg)
+            sliders_row.addWidget(sld_bg)
+            sliders_row.addWidget(lbl_fg)
+            sliders_row.addWidget(sld_fg)
+            block.addLayout(sliders_row)
+            chk_layout.addLayout(block)
 
         root.addWidget(chk_card)
 
-        hint = QLabel("💡 Совет: расставь виджеты мышкой поверх игры и нажми клавишу F8 — рамки исчезнут, а клики мыши будут проходить сквозь оверлей.")
+        hint = QLabel("💡 У центрального кокпита «Фон» можно поставить на 0% — тогда останется только чистая графика без тёмного прямоугольника. Клавиша F8 включает/выключает пропуск кликов сквозь оверлей.")
         hint.setWordWrap(True)
         hint.setStyleSheet("font-size: 11px; color: #7f8c9f;")
         root.addWidget(hint)
         root.addStretch()
 
+    def _save_global_opts(self):
+        self.layout_cfg["_options"] = {
+            "show_clutch": self.state.show_clutch,
+            "warn_lead_sec": self.state.warn_lead_sec,
+        }
+        save_config(self.layout_cfg)
+
+    def _on_clutch_toggled(self, checked: bool):
+        self.state.show_clutch = checked
+        self._save_global_opts()
+        for w in self.hud_widgets.values():
+            w.update()
+
+    def _on_lead_changed(self, val: int):
+        self.state.warn_lead_sec = val / 10.0
+        self.lbl_lead.setText(f"Предупреждать о тормозе заранее за: {self.state.warn_lead_sec:.1f} сек")
+        self._save_global_opts()
+
     def toggle_widget(self, key: str, checked: bool):
         w = self.hud_widgets[key]
         w.setVisible(checked)
-        if key not in self.layout_cfg:
-            self.layout_cfg[key] = {"x": w.x(), "y": w.y(), "w": w.width(), "h": w.height()}
-        self.layout_cfg[key]["enabled"] = checked
-        save_config(self.layout_cfg)
+        w._save_state()
 
     def toggle_lock(self):
         self.locked = not self.locked
@@ -789,12 +921,11 @@ class ControlPanelWindow(QMainWindow):
         )
 
     def _detect_brake_zones(self, rows):
-        """Находит индексы НАЧАЛА зон торможения (переход Brake с <0.12 на >0.25)."""
         zones = []
         in_zone = False
         for i, r in enumerate(rows):
             b = r["Brake"]
-            if not in_zone and b > 0.25:
+            if not in_zone and b > 0.22:
                 zones.append(i)
                 in_zone = True
             elif in_zone and b < 0.08:
@@ -838,17 +969,23 @@ class ControlPanelWindow(QMainWindow):
         self.state.speed_kmh = float(speed_ms) * 3.6
         self.state.throttle = float(self.irc["Throttle"] or 0.0)
         self.state.brake = float(self.irc["Brake"] or 0.0)
+
+        # В iRacing Clutch: 1.0 = педаль отпущена, 0.0 = выжата в пол -> переводим в 0..1 нажатия
+        raw_clutch = self.irc["Clutch"]
+        self.state.clutch = max(0.0, min(1.0, 1.0 - float(raw_clutch))) if raw_clutch is not None else 0.0
+
         self.state.steer_rad = float(self.irc["SteeringWheelAngle"] or 0.0)
         self.state.gear = int(self.irc["Gear"] or 0)
         self.state.lap_time = float(self.irc["LapCurrentLapTime"] or 0.0)
 
-        self.state.player_trace.append((self.state.lap_pct, self.state.throttle, self.state.brake))
+        self.state.player_trace.append((self.state.lap_pct, self.state.throttle, self.state.brake, self.state.clutch))
 
         if self.state.ref_data:
             t = get_target_state(self.state.lap_pct, self.state.ref_data)
             self.state.t_speed = t["Speed"]
             self.state.t_throttle = t["Throttle"]
             self.state.t_brake = t["Brake"]
+            self.state.t_clutch = t.get("Clutch", 0.0)
             self.state.t_steer_rad = t["SteeringWheelAngle"]
             self.state.t_gear = t["Gear"]
             self.state.t_time = t["Time"]
@@ -867,12 +1004,7 @@ class ControlPanelWindow(QMainWindow):
                 w.update()
 
     def _update_brake_coach(self, speed_ms: float):
-        """
-        Управляет баннером без провалов (исчезновений) между таймером и нажатием тормоза:
-        как только таймер дошёл до <= 0.35 с ИЛИ эталон начал тормозить (> 10%),
-        включается удержание режима BRAKE_NOW, которое горит непрерывно, пока эталон не отпустит тормоз (< 8%).
-        """
-        # 1. Если мы уже внутри активного торможения ИЛИ эталон прямо сейчас держит тормоз (> 12%)
+        # 1. Бесшовное удержание плашки ТОРМОЗИ, пока эталон не отпустит тормоз (< 6%)
         if self.state.t_brake >= 0.12 or (self._brake_hold_active and self.state.t_brake >= 0.06):
             self._brake_hold_active = True
             self.state.banner_mode = "BRAKE_NOW"
@@ -886,7 +1018,7 @@ class ControlPanelWindow(QMainWindow):
         self.state.brake_in_sec = None
         self.state.brake_dist_m = None
 
-        # 2. Ищем ближайшую ТОЧКУ НАЧАЛА торможения впереди по трассе (от 0.0 до 20% круга)
+        # 2. Смотрим вперёд до 35% круга, чтобы заранее видеть торможение даже на длинных прямых
         best_dpct = None
         best_zone_id = -1
         for z_idx in self.state.brake_zones:
@@ -894,30 +1026,32 @@ class ControlPanelWindow(QMainWindow):
             d = z_pct - self.state.lap_pct
             if d < 0:
                 d += 1.0
-            if 0.0 <= d < 0.20 and (best_dpct is None or d < best_dpct):
+            if 0.0 <= d < 0.35 and (best_dpct is None or d < best_dpct):
                 best_dpct = d
                 best_zone_id = z_idx
 
         if best_dpct is not None and speed_ms > 4.0:
             dist_m = best_dpct * self.state.track_len
             sec = dist_m / speed_ms
-            if sec <= 3.2:
+            lead_limit = self.state.warn_lead_sec
+
+            if sec <= lead_limit:
                 self.state.brake_in_sec = sec
                 self.state.brake_dist_m = dist_m
                 if sec <= 0.35:
-                    # Плавный бесшовный переход в BRAKE_NOW до того, как машина пересечёт точку
                     self._brake_hold_active = True
                     self.state.banner_mode = "BRAKE_NOW"
-                else:
+                elif sec <= 2.4:
                     self.state.banner_mode = "BRAKE_SOON"
+                else:
+                    self.state.banner_mode = "BRAKE_PREP"
 
-                if sec <= 1.1 and self._last_beep_zone != best_zone_id:
+                if sec <= 1.2 and self._last_beep_zone != best_zone_id:
                     self._last_beep_zone = best_zone_id
                     if winsound:
                         threading.Thread(target=lambda: winsound.Beep(880, 95), daemon=True).start()
                 return
 
-        # 3. Подсказка полного газа на выходе
         if self.state.t_brake < 0.05 and self.state.t_throttle > 0.90 and self.state.throttle < 0.70:
             self.state.banner_mode = "THROTTLE"
 

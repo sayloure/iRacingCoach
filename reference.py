@@ -28,7 +28,6 @@ def load_garage61_csv(csv_path):
     with open(csv_path, mode="r", encoding="utf-8-sig", newline="") as f:
         lines = f.readlines()
 
-    # Ищем строку с заголовками (если сверху есть метаданные Garage61)
     header_idx = 0
     for idx, line in enumerate(lines[:20]):
         low = line.lower()
@@ -45,6 +44,7 @@ def load_garage61_csv(csv_path):
     col_speed = _find_column(headers, "Speed", "Speed (km/h)", "speed_kmh", "Velocity")
     col_brake = _find_column(headers, "Brake", "BrakePct")
     col_throttle = _find_column(headers, "Throttle", "ThrottlePct")
+    col_clutch = _find_column(headers, "Clutch", "ClutchPct")
     col_steer = _find_column(headers, "SteeringWheelAngle", "Steer", "SteeringAngle")
     col_gear = _find_column(headers, "Gear")
     col_time = _find_column(headers, "LapCurrentLapTime", "LapTime", "SessionTime", "Time")
@@ -63,6 +63,7 @@ def load_garage61_csv(csv_path):
             "Speed": _safe_float(row.get(col_speed)),
             "Brake": _safe_float(row.get(col_brake)),
             "Throttle": _safe_float(row.get(col_throttle)),
+            "Clutch": _safe_float(row.get(col_clutch), 1.0) if col_clutch else 1.0,
             "SteeringWheelAngle": _safe_float(row.get(col_steer)) if col_steer else 0.0,
             "Gear": int(round(_safe_float(row.get(col_gear), 0))) if col_gear else 0,
             "Time": _safe_float(row.get(col_time), -1.0) if col_time else -1.0,
@@ -71,44 +72,54 @@ def load_garage61_csv(csv_path):
     if not rows:
         return []
 
-    # Нормализация единиц измерения
     max_pct = max(r["LapDistPct"] for r in rows)
-    if max_pct > 1.5:  # если в процентах 0..100
+    if max_pct > 1.5:
         for r in rows:
             r["LapDistPct"] /= 100.0
 
     max_speed = max(r["Speed"] for r in rows)
-    # В iRacing / Garage61 скорость в м/с (обычно макс < 110 м/с). Переводим в км/ч:
     if max_speed < 115.0:
         for r in rows:
             r["Speed"] *= 3.6
 
     max_thr = max(r["Throttle"] for r in rows)
-    if max_thr > 1.5:  # если 0..100 -> переводим в 0..1
+    if max_thr > 1.5:
         for r in rows:
             r["Throttle"] /= 100.0
 
     max_brk = max(r["Brake"] for r in rows)
-    if max_brk > 1.5:  # если 0..100 -> переводим в 0..1
+    if max_brk > 1.5:
         for r in rows:
             r["Brake"] /= 100.0
 
+    # Нормализация сцепления (в iRacing 1.0 = отпущено, 0.0 = нажато в пол -> переводим в 0..1 нажатия педали)
+    if col_clutch:
+        max_cl = max(r["Clutch"] for r in rows)
+        if max_cl > 1.5:
+            for r in rows:
+                r["Clutch"] /= 100.0
+        avg_cl = sum(r["Clutch"] for r in rows) / len(rows)
+        if avg_cl > 0.5:
+            # Стандарт iRacing: большую часть круга Clutch = 1.0 (отпущено) -> инвертируем в процент нажатия
+            for r in rows:
+                r["Clutch"] = max(0.0, min(1.0, 1.0 - r["Clutch"]))
+    else:
+        for r in rows:
+            r["Clutch"] = 0.0
+
     max_steer = max(abs(r["SteeringWheelAngle"]) for r in rows)
-    # Если руль в градусах (> 12), переводим в радианы для единого формата с iRacing
     if max_steer > 12.0:
         for r in rows:
             r["SteeringWheelAngle"] = math.radians(r["SteeringWheelAngle"])
 
     rows.sort(key=lambda r: r["LapDistPct"])
 
-    # Расчёт эталонного времени круга от 0.0 с (для точной Дельты)
     has_valid_time = all(r["Time"] >= 0 for r in rows) and (rows[-1]["Time"] > rows[0]["Time"])
     if has_valid_time:
         t0 = rows[0]["Time"]
         for r in rows:
             r["Time"] -= t0
     else:
-        # Интегрируем время по скорости и дистанции (при стандартной длине круга 4000 м)
         t_acc = 0.0
         rows[0]["Time"] = 0.0
         for i in range(1, len(rows)):
@@ -126,13 +137,13 @@ def get_target_state(current_lap_dist, ref_data):
             "Speed": 0.0,
             "Brake": 0.0,
             "Throttle": 0.0,
+            "Clutch": 0.0,
             "SteeringWheelAngle": 0.0,
             "Gear": 0,
             "Time": 0.0,
             "Index": 0,
         }
 
-    # Быстрый поиск ближайшей точки на кольце 0.0 .. 1.0
     best = 0
     best_dist = float("inf")
     for i, r in enumerate(ref_data):
@@ -147,6 +158,7 @@ def get_target_state(current_lap_dist, ref_data):
         "Speed": pt["Speed"],
         "Brake": pt["Brake"],
         "Throttle": pt["Throttle"],
+        "Clutch": pt.get("Clutch", 0.0),
         "SteeringWheelAngle": pt["SteeringWheelAngle"],
         "Gear": pt.get("Gear", 0),
         "Time": pt.get("Time", 0.0),

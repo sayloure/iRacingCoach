@@ -11,14 +11,18 @@
     "y": 243,
     "w": 440,
     "h": 82,
-    "enabled": true
+    "enabled": true,
+    "bg_opacity": 85,
+    "fg_opacity": 100
   },
   "steer": {
-    "x": 1556,
-    "y": 414,
+    "x": 1375,
+    "y": 619,
     "w": 380,
     "h": 290,
-    "enabled": true
+    "enabled": true,
+    "bg_opacity": 0,
+    "fg_opacity": 100
   },
   "delta": {
     "x": 786,
@@ -33,5 +37,9 @@
     "w": 210,
     "h": 260,
     "enabled": true
+  },
+  "_options": {
+    "show_clutch": true,
+    "warn_lead_sec": 8.0
   }
 }
