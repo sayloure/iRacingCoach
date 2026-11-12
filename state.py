@@ -29,8 +29,11 @@ class TelemetryState:
         self.cp_show_player_on_rib = True
         self.cp_show_pedal_match = True
         self.cp_show_steer = True
-        self.cp_show_gear = True
-        self.cp_show_speed = True
+        self.cp_show_steer_text = True
+        # Режим передач: "mismatch" (только при неверной), "always" (всегда), "off" (выкл)
+        self.cp_gear_mode = "mismatch"
+        self.cp_show_speed_you = True
+        self.cp_show_speed_ref = True
         self.cp_show_brake = True
         self.cp_show_throttle = True
         self.cp_show_clutch = False
@@ -44,6 +47,10 @@ class TelemetryState:
         self.cp_op_brake = 100
         self.cp_op_throttle = 100
         self.cp_op_clutch = 100
+
+        # Смещение 3D-траектории внутри виджета Кокпита (в пикселях)
+        self.cp_ribbon_dx = 0
+        self.cp_ribbon_dy = 0
 
         # Эталон в текущей точке
         self.t_speed = 0.0

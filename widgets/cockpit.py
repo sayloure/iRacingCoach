@@ -8,6 +8,55 @@ from .pedals import draw_unified_pedal_bar
 
 
 class SteerGearRibbonWidget(DraggableHUDWidget):
+    def __init__(self, key_name, title, default_rect, state, layout_cfg, default_bg_pct=0, min_size=(260, 180)):
+        super().__init__(key_name, title, default_rect, state, layout_cfg, default_bg_pct, min_size)
+        self._ribbon_rect = QRectF()
+        self._dragging_ribbon = False
+        self._rib_drag_start_mouse = None
+        self._rib_drag_start_offset = (0, 0)
+        self.on_internal_change = None
+
+    def _in_ribbon_zone(self, local_pos) -> bool:
+        return (
+            not self.locked
+            and self.state.cp_show_ribbon
+            and not self._in_resize_zone(local_pos)
+            and self._ribbon_rect.contains(QPointF(local_pos))
+        )
+
+    def mousePressEvent(self, event):
+        if not self.locked and event.button() == Qt.MouseButton.LeftButton:
+            local_pt = event.position().toPoint()
+            if self._in_ribbon_zone(local_pt):
+                self._dragging_ribbon = True
+                self._rib_drag_start_mouse = event.globalPosition().toPoint()
+                self._rib_drag_start_offset = (self.state.cp_ribbon_dx, self.state.cp_ribbon_dy)
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self.locked:
+            if self._dragging_ribbon and self._rib_drag_start_mouse is not None:
+                delta = event.globalPosition().toPoint() - self._rib_drag_start_mouse
+                self.state.cp_ribbon_dx = max(-220, min(220, self._rib_drag_start_offset[0] + delta.x()))
+                self.state.cp_ribbon_dy = max(-150, min(150, self._rib_drag_start_offset[1] + delta.y()))
+                self.update()
+                return
+            local_pt = event.position().toPoint()
+            if self._in_ribbon_zone(local_pt):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging_ribbon:
+            self._dragging_ribbon = False
+            self._rib_drag_start_mouse = None
+            if callable(self.on_internal_change):
+                self.on_internal_change()
+            return
+        super().mouseReleaseEvent(event)
+
     def _set_elem_opacity(self, p: QPainter, elem_pct: int):
         base_op = self.fg_opacity_pct / 100.0
         p.setOpacity(base_op * (max(10, min(100, elem_pct)) / 100.0))
@@ -20,7 +69,7 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         pedal_top = int(h * 0.14)
         pedal_h = int(h * 0.76)
 
-        # Левые педали с индивидуальной прозрачностью
+        # Левые педали
         left_pedals = []
         if self.state.cp_show_clutch:
             left_pedals.append(("СЦЕПЛ", self.state.clutch, self.state.t_clutch, QColor(0, 210, 255), self.state.cp_op_clutch))
@@ -64,7 +113,14 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         center_w = max(140, center_right - center_left)
 
         # 1. Голографическая 3D-лента траектории
-        ribbon_h = int(h * 0.56) if (self.state.cp_show_steer or self.state.cp_show_gear or self.state.cp_show_speed) else int(h * 0.88)
+        gear_mode = self.state.cp_gear_mode
+        has_bottom_ui = (
+            self.state.cp_show_steer
+            or gear_mode != "off"
+            or self.state.cp_show_speed_you
+            or self.state.cp_show_speed_ref
+        )
+        ribbon_h = int(h * 0.56) if has_bottom_ui else int(h * 0.88)
         if self.state.cp_show_ribbon:
             self._draw_trajectory_ribbon(p, center_left, center_w, ribbon_h)
 
@@ -118,34 +174,40 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
             p.setPen(QPen(Qt.GlobalColor.white, 7))
             p.drawArc(rect_outer, you_ang - 4 * 16, 8 * 16)
 
-            lbl_y = arc_y + int(arc_h * 0.42)
-            left_box_x = max(center_left - 4, arc_x - 74)
-            right_box_x = min(center_left + center_w - 72, arc_x + arc_w - 2)
+            if self.state.cp_show_steer_text:
+                lbl_y = arc_y + int(arc_h * 0.42)
+                left_box_x = max(center_left - 4, arc_x - 74)
+                right_box_x = min(center_left + center_w - 72, arc_x + arc_w - 2)
 
-            p.setFont(QFont(FONT_UI, 7, QFont.Weight.Bold))
-            p.setPen(QColor(255, 110, 95) if diff >= 14 else you_col)
-            p.drawText(left_box_x, lbl_y, 74, 14, Qt.AlignmentFlag.AlignRight, "ТЫ (РУЛЬ)")
-            p.setFont(QFont(FONT_MONO, 13, QFont.Weight.Bold))
-            p.drawText(left_box_x, lbl_y + 13, 74, 22, Qt.AlignmentFlag.AlignRight, f"{you_deg:+.0f}°")
+                p.setFont(QFont(FONT_UI, 7, QFont.Weight.Bold))
+                p.setPen(QColor(255, 110, 95) if diff >= 14 else you_col)
+                p.drawText(left_box_x, lbl_y, 74, 14, Qt.AlignmentFlag.AlignRight, "ТЫ (РУЛЬ)")
+                p.setFont(QFont(FONT_MONO, 13, QFont.Weight.Bold))
+                p.drawText(left_box_x, lbl_y + 13, 74, 22, Qt.AlignmentFlag.AlignRight, f"{you_deg:+.0f}°")
 
-            p.setFont(QFont(FONT_UI, 7, QFont.Weight.Bold))
-            p.setPen(QColor(255, 180, 70))
-            p.drawText(right_box_x, lbl_y, 74, 14, Qt.AlignmentFlag.AlignLeft, "ЭТАЛОН")
-            p.setFont(QFont(FONT_MONO, 13, QFont.Weight.Bold))
-            p.drawText(right_box_x, lbl_y + 13, 74, 22, Qt.AlignmentFlag.AlignLeft, f"{ref_deg:+.0f}°")
+                p.setFont(QFont(FONT_UI, 7, QFont.Weight.Bold))
+                p.setPen(QColor(255, 180, 70))
+                p.drawText(right_box_x, lbl_y, 74, 14, Qt.AlignmentFlag.AlignLeft, "ЭТАЛОН")
+                p.setFont(QFont(FONT_MONO, 13, QFont.Weight.Bold))
+                p.drawText(right_box_x, lbl_y + 13, 74, 22, Qt.AlignmentFlag.AlignLeft, f"{ref_deg:+.0f}°")
 
-        # 3. ИСПРАВЛЕННЫЙ Блок Передачи (никакой белой заливки от кисти, чёткое тёмное стекло и яркие цифры!)
+        # 3. Блок Передачи ("mismatch" = только при неверной передаче; "always" = всегда)
         gear_y = int(h * 0.65)
-        if self.state.cp_show_gear:
-            self._set_elem_opacity(p, self.state.cp_op_gear)
-            g_you = self.state.gear
-            g_ref = self.state.t_gear
-            g_you_str = "R" if g_you == -1 else "N" if g_you == 0 else str(g_you)
-            g_ref_str = str(g_ref) if g_ref > 0 else "-"
+        g_you = self.state.gear
+        g_ref = self.state.t_gear
+        g_you_str = "R" if g_you == -1 else "N" if g_you == 0 else str(g_you)
+        g_ref_str = str(g_ref) if g_ref > 0 else "-"
+        mismatch = (g_ref > 0 and g_you != g_ref)
 
-            mismatch = (g_ref > 0 and g_you != g_ref)
-            box_w = min(200, int(center_w * 0.64)) if mismatch else min(115, int(center_w * 0.42))
-            box_h = max(36, int(h * 0.13))
+        show_gear_now = (
+            (gear_mode == "mismatch" and mismatch)
+            or (gear_mode == "always" and self.state.connected)
+        )
+
+        if show_gear_now:
+            self._set_elem_opacity(p, self.state.cp_op_gear)
+            box_h = max(38, int(h * 0.135))
+            box_w = min(195, int(center_w * 0.62)) if mismatch else max(54, int(box_h * 1.45))
             box_x = center_left + (center_w - box_w) // 2
 
             badge_path = QPainterPath()
@@ -155,39 +217,50 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
                 is_downshift = (g_ref < g_you)
                 arrow = "↓" if is_downshift else "↑"
                 g_text = f"{g_you_str} → {g_ref_str} {arrow}"
-                bg_col = QColor(45, 14, 16, 220) if is_downshift else QColor(12, 32, 48, 220)
+                bg_col = QColor(45, 14, 16, 225) if is_downshift else QColor(12, 32, 48, 225)
                 border_col = QColor(255, 95, 45) if is_downshift else QColor(0, 225, 255)
                 text_col = QColor(255, 195, 55) if is_downshift else QColor(100, 255, 180)
+                gear_fs = max(16, min(26, int(box_h * 0.52)))
+            else:
+                g_text = g_you_str
+                bg_col = QColor(12, 20, 28, 175)
+                border_col = QColor(70, 210, 245, 110)
+                text_col = QColor(240, 248, 255)
+                gear_fs = max(20, min(32, int(box_h * 0.62)))
 
-                p.fillPath(badge_path, bg_col)
-                # ВАЖНО: сбрасываем кисть в NoBrush, чтобы drawPath рисовал ТОЛЬКО рамку, не заливая блок белым!
-                p.setBrush(Qt.BrushStyle.NoBrush)
+            p.fillPath(badge_path, bg_col)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            if mismatch:
                 p.setPen(QPen(QColor(border_col.red(), border_col.green(), border_col.blue(), 80), 4.5))
                 p.drawPath(badge_path)
-                p.setPen(QPen(border_col, 2.0))
-                p.drawPath(badge_path)
-            else:
-                g_text = f"GEAR {g_you_str}"
-                p.fillPath(badge_path, QColor(12, 20, 28, 175))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(QColor(70, 210, 245, 110), 1.4))
-                p.drawPath(badge_path)
-                text_col = QColor(235, 245, 255)
+            p.setPen(QPen(border_col, 2.0 if mismatch else 1.4))
+            p.drawPath(badge_path)
 
-            gear_fs = max(17, min(28, int(box_h * 0.54)))
             p.setFont(QFont(FONT_MONO, gear_fs, QFont.Weight.Bold))
             p.setPen(text_col)
             p.drawText(box_x, gear_y, box_w, box_h, Qt.AlignmentFlag.AlignCenter, g_text)
 
         # 4. Блок Скорости
-        if self.state.cp_show_speed:
+        show_you_spd = self.state.cp_show_speed_you
+        show_ref_spd = self.state.cp_show_speed_ref
+        if show_you_spd or show_ref_spd:
             self._set_elem_opacity(p, self.state.cp_op_speed)
-            spd_y = gear_y + max(38, int(h * 0.14)) if self.state.cp_show_gear else gear_y + 8
+            spd_y = gear_y + max(40, int(h * 0.145)) if gear_mode != "off" else gear_y + 8
             spd_fs = max(10, min(15, int(h * 0.042)))
             p.setFont(QFont(FONT_MONO, spd_fs, QFont.Weight.Bold))
-            p.setPen(QColor(255, 200, 90) if abs(self.state.delta_speed) > 5 else QColor(185, 240, 215))
-            p.drawText(center_left, spd_y, center_w, 22, Qt.AlignmentFlag.AlignCenter,
-                       f"{self.state.speed_kmh:.0f} км/ч  (эталон: {self.state.t_speed:.0f})")
+
+            if show_you_spd and show_ref_spd:
+                spd_txt = f"{self.state.speed_kmh:.0f} км/ч  (эталон: {self.state.t_speed:.0f})"
+                spd_col = QColor(255, 200, 90) if abs(self.state.delta_speed) > 5 else QColor(185, 240, 215)
+            elif show_you_spd:
+                spd_txt = f"{self.state.speed_kmh:.0f} км/ч"
+                spd_col = QColor(220, 240, 250)
+            else:
+                spd_txt = f"эталон: {self.state.t_speed:.0f} км/ч"
+                spd_col = QColor(255, 195, 85)
+
+            p.setPen(spd_col)
+            p.drawText(center_left, spd_y, center_w, 22, Qt.AlignmentFlag.AlignCenter, spd_txt)
 
     def _find_player_input_at(self, target_pct: float):
         trace = self.state.player_trace
@@ -212,6 +285,18 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
 
         self._set_elem_opacity(p, self.state.cp_op_ribbon)
 
+        dx = self.state.cp_ribbon_dx
+        dy = self.state.cp_ribbon_dy
+
+        self._ribbon_rect = QRectF(x_offset + dx + 10, 8 + dy, w_zone - 20, h_zone - 8)
+
+        if not self.locked:
+            p.setPen(QPen(QColor(255, 210, 60, 140), 1, Qt.PenStyle.DotLine))
+            p.drawRoundedRect(self._ribbon_rect, 6, 6)
+            p.setFont(QFont(FONT_UI, 7, QFont.Weight.Bold))
+            p.setPen(QColor(255, 215, 80, 210))
+            p.drawText(int(self._ribbon_rect.left() + 6), int(self._ribbon_rect.top() + 12), "✥ Траектория (двигай)")
+
         n = len(ref)
         idx0 = self.state.ref_idx
         steps = 26
@@ -220,9 +305,9 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         lookahead_pct = min(0.055, 155.0 / max(1000.0, self.state.track_len))
         step_stride = max(1, int((n * lookahead_pct) / (steps - car_step)))
 
-        cx = x_offset + w_zone * 0.5
-        bottom_y = h_zone - 2
-        top_y = 12
+        cx = x_offset + w_zone * 0.5 + dx
+        bottom_y = h_zone - 2 + dy
+        top_y = 12 + dy
 
         rel_x = [0.0] * steps
         slope = 0.0
@@ -278,7 +363,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
             p.setPen(QPen(QColor(120, 175, 210, int(45 * fade)), 1))
             p.drawPolygon(poly_road)
 
-            # Внутренняя лента ЭТАЛОНА (ширина = степень нажатия педали рефом)
             if brk > 0.05 or next_brk > 0.05:
                 ref_col = QColor(255, 40, 55, int(alpha * 0.92)) if max(brk, next_brk) > 0.30 else QColor(255, 155, 30, int(alpha * 0.88))
                 edge_col = QColor(255, 110, 120, int(230 * fade))
@@ -317,7 +401,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
             p.drawLine(pts_q1[s], pts_q1[s + 1])
             p.drawLine(pts_q3[s], pts_q3[s + 1])
 
-            # След педалей игрока позади линии
             if self.state.cp_show_player_on_rib and s < car_step:
                 u_thr, u_brk = self._find_player_input_at(seg_pct)
                 u_val = u_brk if u_brk > 0.05 else (u_thr if u_thr > 0.05 else 0.0)
@@ -343,7 +426,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
                 p.setPen(QColor(210, 230, 245, 200))
                 p.drawText(int(pts_right[s].x() + 6), int(pts_right[s].y() + 4), dist_label)
 
-        # Горизонтальная полоса позиции машины (вертикальные палочки теперь показывают ТВОЁ нажатие!)
         if self.state.cp_show_player_on_rib:
             self._set_elem_opacity(p, self.state.cp_op_player_on_rib)
             pL = pts_left[car_step]
@@ -385,19 +467,16 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
             p.setPen(QPen(main_line_col, 2.2))
             p.drawLine(line_L, line_R)
 
-            # Живой бегунок ТВОЕГО нажатия + яркие вертикальные ПАЛОЧКИ на концах ТВОЕГО ползунка!
             if you_active > 0.02:
                 uw = hw * min(1.0, you_active)
                 fill_c = QColor(0, 255, 185) if is_matched else QColor(255, 225, 70) if (you_b > 0.05 or ref_b > 0.08) else QColor(70, 255, 130)
                 p.setPen(QPen(fill_c, 5.0))
                 p.drawLine(QPointF(pC.x() - uw, pC.y()), QPointF(pC.x() + uw, pC.y()))
 
-                # Вертикальные палочки-засечки на концах ТВОЕГО нажатия (совмещай их с шириной ленты эталона!)
                 p.setPen(QPen(Qt.GlobalColor.white, 2.8))
                 p.drawLine(QPointF(pC.x() - uw, pC.y() - 6), QPointF(pC.x() - uw, pC.y() + 6))
                 p.drawLine(QPointF(pC.x() + uw, pC.y() - 6), QPointF(pC.x() + uw, pC.y() + 6))
 
-            # Центральный маркер машины
             chev = QPolygonF([
                 QPointF(pC.x(), pC.y() - 7),
                 QPointF(pC.x() - 7, pC.y() + 4),
