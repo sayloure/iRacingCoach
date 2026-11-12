@@ -9,10 +9,10 @@
     "fg_opacity": 100
   },
   "banner": {
-    "x": 1506,
-    "y": 243,
+    "x": 1484,
+    "y": 145,
     "w": 440,
-    "h": 82,
+    "h": 90,
     "enabled": true,
     "bg_opacity": 85,
     "fg_opacity": 100
