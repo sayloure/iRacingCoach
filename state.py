@@ -20,6 +20,13 @@ class TelemetryState:
         self.laps_remain = -1
         self.position = 0
 
+        # Режим частоты кадров (30 или 60 FPS) и замер реального FPS
+        self.target_fps = 60
+        self.actual_fps = 0.0
+
+        # Общее время круга эталона (в секундах)
+        self.ref_lap_time = 0.0
+
         # Глобальные настройки и настройки отдельного виджета Педалей
         self.show_clutch = False
         self.warn_lead_sec = 5.0
@@ -32,7 +39,6 @@ class TelemetryState:
         self.cp_show_pedal_match = True
         self.cp_show_steer = True
         self.cp_show_steer_text = True
-        # Режим передач: "mismatch" (только при неверной), "always" (всегда), "off" (выкл)
         self.cp_gear_mode = "always"
         self.cp_show_speed_you = True
         self.cp_show_speed_ref = True
@@ -49,9 +55,9 @@ class TelemetryState:
         # 2) Сила затухания прозрачности от верха к середине траектории (0..100%)
         self.cp_ribbon_top_fade = 55
 
-        # Максимальный угол шкалы руля в каждую сторону (90..360 градусов, по умолчанию 220°)
+        # Максимальный угол шкалы руля в каждую сторону (90..360 градусов)
         self.cp_steer_max_deg = 220
-        self.cp_steer_auto_scale = True  # Авто-подстройка под максимум загруженного рефа
+        self.cp_steer_auto_scale = True
 
         # Цвет текста градусов руля (HEX)
         self.cp_steer_text_color = "#c8e1f5"
@@ -99,15 +105,20 @@ class TelemetryState:
         self.t_gear = 0
         self.t_time = 0.0
         self.ref_idx = 0
+        self.ref_pcts = []
+        # Предварительно облегчённый массив эталона специально для быстрого и стабильного графика без пульсации
+        self.ref_graph_pts = []
+        self.ref_graph_pcts = []
 
         # Метрики тренера
         self.delta_sec = 0.0
         self.delta_speed = 0.0
+        self.delta_valid = False
         self.brake_in_sec = None
         self.brake_dist_m = None
         self.banner_mode = ""
 
         self.ref_data = []
         self.brake_zones = []
-        self.player_trace = deque(maxlen=300)
+        self.player_trace = deque(maxlen=180)
         self.delta_history = deque(maxlen=120)

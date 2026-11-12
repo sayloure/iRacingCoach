@@ -18,10 +18,10 @@
     "fg_opacity": 100
   },
   "steer": {
-    "x": 1211,
-    "y": 664,
-    "w": 1009,
-    "h": 659,
+    "x": 1410,
+    "y": 696,
+    "w": 620,
+    "h": 360,
     "enabled": true,
     "bg_opacity": 0,
     "fg_opacity": 100
@@ -29,8 +29,8 @@
   "pedals": {
     "x": 137,
     "y": 1049,
-    "w": 355,
-    "h": 256,
+    "w": 240,
+    "h": 260,
     "enabled": true,
     "bg_opacity": 80,
     "fg_opacity": 100
@@ -45,10 +45,11 @@
     "fg_opacity": 100
   },
   "_options": {
-    "show_clutch": true,
-    "warn_lead_sec": 8.0,
+    "target_fps": 60,
+    "show_clutch": false,
+    "warn_lead_sec": 5.0,
     "pedals_show_you_pct": true,
-    "pedals_show_ref_pct": false,
+    "pedals_show_ref_pct": true,
     "lock_vk": 119,
     "hide_vk": 120,
     "cp_offsets": {
@@ -95,12 +96,12 @@
       "throttle": 100,
       "clutch": 100
     },
-    "cp_gear_mode": "mismatch",
-    "cp_ribbon_top_reach": 83,
+    "cp_gear_mode": "always",
+    "cp_ribbon_top_reach": 75,
     "cp_ribbon_top_fade": 55,
     "cp_steer_max_deg": 200,
     "cp_steer_auto_scale": true,
-    "cp_steer_text_color": "#00aaff",
+    "cp_steer_text_color": "#c8e1f5",
     "cp_show_ribbon": true,
     "cp_show_player_on_rib": true,
     "cp_show_pedal_match": true,
@@ -112,7 +113,7 @@
     "cp_show_throttle": true,
     "cp_show_clutch": false,
     "cp_pedal_show_you_pct": true,
-    "cp_pedal_show_ref_pct": false,
+    "cp_pedal_show_ref_pct": true,
     "cp_op_ribbon": 100,
     "cp_op_player_on_rib": 100,
     "cp_op_steer": 100,

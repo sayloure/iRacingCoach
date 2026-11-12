@@ -3,6 +3,7 @@ from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QBrush, QPolygonF, QPainterPath
 
 from config import FONT_UI, FONT_MONO
+from reference import get_target_state
 from .base import DraggableHUDWidget
 from .pedals import draw_unified_pedal_bar
 
@@ -30,6 +31,7 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         self._mod_drag_start_offset = (0, 0)
         self._mod_resize_start_scale = 100
         self._hovered_mod = None
+        self._smooth_rel_x = None
         self.on_internal_change = None
 
     def _get_offset(self, mod_key: str):
@@ -308,11 +310,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         self._draw_mod_edit_box(p, "gear", QRectF(bx - 24, by - int(22 * sc), box_w + 48, box_h + int(26 * sc)))
 
     def _draw_tactical_steer(self, p: QPainter, w: int, h: int):
-        """
-        Расширенная прогрессивная дуга руля (по умолчанию ±220°, настраивается 90..360°):
-        - Нелинейная кривая (gamma = 0.82) сохраняет высокую точность около 0° и вмещает шпильки до 220°+.
-        - Промежуточные засечки на ±90° и индикация перекрута (◄ / ►), если угол вышел за предел шкалы.
-        """
         self._set_elem_opacity(p, self.state.cp_op_steer)
         dx, dy = self._get_offset("steer")
         sc = self._get_scale("steer")
@@ -327,10 +324,9 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         max_deg = float(max(90, min(360, self.state.cp_steer_max_deg)))
 
         if self.state.cp_show_steer:
-            # Расширенный сектор дуги: от 15° до 165° (охватывает 150 градусов!)
             start_deg = 15
             span_deg = 150
-            half_arc_span = 72.0  # Половина рабочего хода от 90° (12 часов) влево/вправо
+            half_arc_span = 72.0
 
             rect_band = QRectF(cx - rx, arc_top_y, rx * 2, ry * 2)
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -347,7 +343,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
             p.drawArc(r_in, start_deg * 16, span_deg * 16)
 
             def angle_point(steer_d: float, radius_offset: float):
-                # Прогрессивное (нелинейное) отображение: высокая чувствительность в центре и запас по краям
                 norm = max(-1.0, min(1.0, steer_d / max_deg))
                 curved = math.copysign(math.pow(abs(norm), 0.85), norm)
                 rad = math.radians(90.0 - curved * half_arc_span)
@@ -355,7 +350,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
                 py = (arc_top_y + ry) - (ry + radius_offset) * math.sin(rad)
                 return QPointF(px, py)
 
-            # Ось центра (0°) + промежуточные ориентиры на ±90°
             p.setPen(QPen(QColor(180, 215, 235, 150), 1.3))
             p.drawLine(cx, arc_top_y - off_r, cx, arc_top_y + off_r + 1)
 
@@ -375,13 +369,11 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.drawPolygon(tri_top)
 
-            # 1. Метка ЭТАЛОНА (REF)
             pt_ref_out = angle_point(ref_deg, +9 * sc)
             pt_ref_in = angle_point(ref_deg, -9 * sc)
             p.setPen(QPen(QColor(255, 185, 50, 230), max(2.2, 3.8 * sc), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.drawLine(pt_ref_in, pt_ref_out)
 
-            # 2. Метка ИГРОКА (YOU) — прямая неоновая игла
             pt_you_out = angle_point(you_deg, +11 * sc)
             pt_you_in = angle_point(you_deg, -11 * sc)
             diff = abs(you_deg - ref_deg)
@@ -392,7 +384,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
             p.setPen(QPen(Qt.GlobalColor.white, max(1.8, 2.8 * sc), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.drawLine(pt_you_in, pt_you_out)
 
-            # Если руль вывернут дальше предела шкалы — подсвечиваем предупреждающий маркер на краю
             if abs(you_deg) > max_deg or abs(ref_deg) > max_deg:
                 over_right = (you_deg > max_deg or ref_deg > max_deg)
                 edge_pt = angle_point(max_deg if over_right else -max_deg, 0)
@@ -404,7 +395,6 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
 
             self._draw_mod_edit_box(p, "steer", QRectF(cx - rx - 14, arc_top_y - 18, (rx + 14) * 2, ry + 24))
 
-        # ОТДЕЛЬНО ПЕРЕТАСКИВАЕМЫЙ ТЕКСТ РУЛЯ
         if self.state.cp_show_steer_text:
             tdx, tdy = self._get_offset("steer_text")
             tsc = self._get_scale("steer_text")
@@ -453,21 +443,14 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         p.drawText(s_rect, Qt.AlignmentFlag.AlignCenter, spd_txt)
         self._draw_mod_edit_box(p, "speed", s_rect)
 
-    def _find_player_input_at(self, target_pct: float):
+    def _find_player_input_at(self, steps_behind: int):
         trace = self.state.player_trace
-        if not trace:
+        n_t = len(trace)
+        if n_t == 0 or steps_behind <= 0:
             return self.state.throttle, self.state.brake
-        best_thr, best_brk = self.state.throttle, self.state.brake
-        best_d = 999.0
-        for pct, thr, brk, _ in trace:
-            raw = abs(target_pct - pct)
-            d = 1.0 - raw if raw > 0.5 else raw
-            if d < best_d:
-                best_d = d
-                best_thr, best_brk = thr, brk
-        if best_d > 0.015:
-            return 0.0, 0.0
-        return best_thr, best_brk
+        idx = max(0, n_t - 1 - steps_behind * 2)
+        item = trace[idx]
+        return item[1], item[2]
 
     def _draw_trajectory_ribbon(self, p: QPainter, x_offset: int, w_zone: int, h_full: int):
         ref = self.state.ref_data
@@ -478,16 +461,25 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
         dx, dy = self._get_offset("ribbon")
         sc = self._get_scale("ribbon")
 
-        n = len(ref)
-        idx0 = self.state.ref_idx
-        steps = 28
-        car_step = 6
+        steps = 20
+        car_step = 4
 
         reach_factor = max(0.25, min(1.0, self.state.cp_ribbon_top_reach / 100.0))
         top_fade_strength = max(0.0, min(1.0, self.state.cp_ribbon_top_fade / 100.0))
 
-        lookahead_pct = min(0.055, (160.0 * reach_factor) / max(1000.0, self.state.track_len))
-        step_stride = max(1, int((n * lookahead_pct) / (steps - car_step)))
+        track_len = max(1000.0, self.state.track_len)
+        lookahead_pct = min(0.055, (160.0 * reach_factor) / track_len)
+        dpct_step = lookahead_pct / float(max(1, steps - car_step))
+
+        base_pct = self.state.lap_pct
+        ref_pcts = self.state.ref_pcts
+
+        sampled_pts = []
+        for s in range(steps):
+            seg_pct = (base_pct + (s - car_step) * dpct_step) % 1.0
+            pt = get_target_state(seg_pct, ref, ref_pcts)
+            pt["LapDistPct"] = seg_pct
+            sampled_pts.append(pt)
 
         cx = x_offset + w_zone * 0.5 + dx
         base_span_h = (int(h_full * 0.85) - int(h_full * 0.14)) * sc
@@ -500,33 +492,45 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
             QRectF(cx - scaled_w * 0.48, top_y - 6, scaled_w * 0.96, max(40, bottom_y - top_y + 12))
         )
 
-        rel_x = [0.0] * steps
+        raw_rel_x = [0.0] * steps
         slope = 0.0
         cur_x = 0.0
         max_offset = scaled_w * 0.42
         for s in range(car_step + 1, steps):
-            pt = ref[(idx0 + (s - car_step) * step_stride) % n]
+            pt = sampled_pts[s]
             t_ahead = (s - car_step) / float(steps - car_step - 1)
             steer_right_deg = -math.degrees(pt["SteeringWheelAngle"])
-            slope += (steer_right_deg / 90.0) * 3.8 * sc
+            slope += (steer_right_deg / 90.0) * 4.6 * sc
             cur_x += slope * (0.35 + 0.65 * t_ahead)
-            rel_x[s] = max(-max_offset, min(max_offset, cur_x))
+            raw_rel_x[s] = max(-max_offset, min(max_offset, cur_x))
 
         slope_back = 0.0
         cur_x_back = 0.0
         for s in range(car_step - 1, -1, -1):
-            pt = ref[(idx0 + (s - car_step) * step_stride) % n]
+            pt = sampled_pts[s]
             steer_right_deg = -math.degrees(pt["SteeringWheelAngle"])
-            slope_back -= (steer_right_deg / 90.0) * 2.0 * sc
+            slope_back -= (steer_right_deg / 90.0) * 2.4 * sc
             cur_x_back += slope_back * 0.35
-            rel_x[s] = max(-max_offset, min(max_offset, cur_x_back))
+            raw_rel_x[s] = max(-max_offset, min(max_offset, cur_x_back))
+
+        # Межкадровая стабилизация изгиба 3D-дорожки (убирает микро-вибрацию при проезде узлов CSV!)
+        if self._smooth_rel_x is None or len(self._smooth_rel_x) != steps:
+            self._smooth_rel_x = list(raw_rel_x)
+        else:
+            for s in range(steps):
+                diff_x = raw_rel_x[s] - self._smooth_rel_x[s]
+                if abs(diff_x) > 45.0:
+                    self._smooth_rel_x[s] = raw_rel_x[s]
+                else:
+                    self._smooth_rel_x[s] += diff_x * 0.45
+        rel_x = self._smooth_rel_x
 
         pts_left, pts_right, pts_center = [], [], []
         pts_in_l, pts_in_r = [], []
         seg_data = []
 
         for s in range(steps):
-            pt = ref[(idx0 + (s - car_step) * step_stride) % n]
+            pt = sampled_pts[s]
             t = s / float(steps - 1)
             persp_t = math.pow(t, 0.78)
             y = bottom_y - persp_t * (bottom_y - top_y)
@@ -541,8 +545,10 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
 
             seg_data.append((pt["Brake"], pt["Throttle"], t, half_w, pt["LapDistPct"]))
 
+        chev_offset = int((base_pct / max(1e-5, dpct_step)) % 2)
+
         for s in range(steps - 1):
-            brk, thr, t, half_w, seg_pct = seg_data[s]
+            brk, thr, t, half_w, _ = seg_data[s]
             next_brk, next_thr, _, next_half_w, _ = seg_data[s + 1]
 
             if s < car_step:
@@ -599,7 +605,7 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
                 if s == car_step:
                     u_thr, u_brk = self.state.throttle, self.state.brake
                 else:
-                    u_thr, u_brk = self._find_player_input_at(seg_pct)
+                    u_thr, u_brk = self._find_player_input_at(car_step - s)
 
                 u_val = u_brk if u_brk > 0.04 else (u_thr if u_thr > 0.04 else 0.0)
                 if u_val > 0.04:
@@ -620,7 +626,7 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
                     p.setPen(QPen(QColor(255, 255, 255, int(210 * fade)), 1.2))
                     p.drawPolygon(u_poly)
 
-            if s % 2 == 1 and s < steps - 2:
+            if (s + chev_offset) % 2 == 1 and s < steps - 2:
                 chev_poly = QPolygonF([
                     pts_in_l[s],
                     QPointF(c0.x(), c0.y() - (c0.y() - c1.y()) * 0.45),
@@ -634,17 +640,11 @@ class SteerGearRibbonWidget(DraggableHUDWidget):
                 p.drawPolygon(chev_poly)
 
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QColor(rail_col.red(), rail_col.green(), rail_col.blue(), int(90 * fade)), 5.0))
-            p.drawLine(pts_left[s], pts_left[s + 1])
-            p.drawLine(pts_right[s], pts_right[s + 1])
-
             p.setPen(QPen(rail_col, 2.2))
             p.drawLine(pts_left[s], pts_left[s + 1])
             p.drawLine(pts_right[s], pts_right[s + 1])
 
-            p.setPen(QPen(QColor(210, 245, 255, int(105 * fade)), 1.0))
-            p.drawLine(pts_in_l[s], pts_in_l[s + 1])
-            p.drawLine(pts_in_r[s], pts_in_r[s + 1])
+            p.setPen(QPen(QColor(210, 245, 255, int(95 * fade)), 1.0))
             p.drawLine(pts_center[s], pts_center[s + 1])
 
         if self.state.cp_show_player_on_rib:

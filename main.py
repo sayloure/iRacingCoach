@@ -1,6 +1,8 @@
 import sys
 import os
+import re
 import math
+import time
 import ctypes
 import threading
 
@@ -20,7 +22,7 @@ from PyQt6.QtGui import QColor
 import irsdk
 from config import CONFIG_FILE, load_config, save_config, vk_to_name
 from state import TelemetryState
-from reference import load_garage61_csv, get_target_state
+from reference import load_garage61_csv, get_target_state, rebuild_reference_time
 from widgets import (
     BrakeBannerWidget,
     DeltaWidget,
@@ -28,6 +30,20 @@ from widgets import (
     SteerGearRibbonWidget,
     TelemetryGraphWidget,
 )
+
+
+def enable_windows_1ms_timer():
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
+
+def disable_windows_1ms_timer():
+    try:
+        ctypes.windll.winmm.timeEndPeriod(1)
+    except Exception:
+        pass
 
 
 def get_screen_centered_geoms() -> dict:
@@ -118,7 +134,6 @@ class CockpitSettingsDialog(QDialog):
         gear_row.addWidget(sld_gop)
         c_layout.addLayout(gear_row)
 
-        # 1) Ползунок дальности / высоты траектории сверху
         reach_row = QHBoxLayout()
         self.lbl_reach = QLabel(f"Дальность (высота) 3D-траектории сверху: {self.state.cp_ribbon_top_reach}%")
         self.lbl_reach.setStyleSheet("font-size: 12px; color: #ffd166; font-weight: bold;")
@@ -130,7 +145,6 @@ class CockpitSettingsDialog(QDialog):
         reach_row.addWidget(self.sld_reach)
         c_layout.addLayout(reach_row)
 
-        # 2) Ползунок затухания прозрачности от верха к середине траектории
         fade_row = QHBoxLayout()
         self.lbl_fade = QLabel(f"Затухание прозрачности от верха к середине: {self.state.cp_ribbon_top_fade}%")
         self.lbl_fade.setStyleSheet("font-size: 12px; color: #70e1ff; font-weight: bold;")
@@ -142,7 +156,6 @@ class CockpitSettingsDialog(QDialog):
         fade_row.addWidget(self.sld_fade)
         c_layout.addLayout(fade_row)
 
-        # 3) Диапазон градусов шкалы руля (90..360° в каждую сторону + авто-подстройка по CSV)
         steer_lim_row = QHBoxLayout()
         self.lbl_steer_max = QLabel(f"Диапазон шкалы руля: ±{self.state.cp_steer_max_deg}°")
         self.lbl_steer_max.setStyleSheet("font-size: 12px; color: #55efc4; font-weight: bold;")
@@ -452,10 +465,13 @@ class CockpitSettingsDialog(QDialog):
 
 
 class ControlPanelWindow(QMainWindow):
+    FPS_MODES = (30, 60)
+
     def __init__(self):
         super().__init__()
+        enable_windows_1ms_timer()
         self.setWindowTitle("iRacing Coach — Панель управления")
-        self.resize(630, 720)
+        self.resize(630, 750)
         self.setStyleSheet("""
             QMainWindow, QDialog, QWidget { background-color: #10151e; color: #e4e8f0; font-family: 'Segoe UI'; }
             QPushButton {
@@ -476,6 +492,18 @@ class ControlPanelWindow(QMainWindow):
         self.hud_hidden = False
         self._binding_target = None
         self.cockpit_dlg = None
+
+        self._prev_lap_pct = None
+        self._anchor_session_time = None
+        self._anchor_ref_time = 0.0
+        self._track_len_checked = False
+        self._last_trace_pct = None
+        self._last_loaded_filename = "reference.csv"
+        self._tick_counter = 0
+        self._last_synced_session_time = -1.0
+
+        self._fps_frame_count = 0
+        self._fps_last_measure = time.perf_counter()
 
         self._apply_opts_from_cfg()
 
@@ -502,6 +530,11 @@ class ControlPanelWindow(QMainWindow):
             "graph": TelemetryGraphWidget("graph", "График телеметрии", g_g[:4], self.state, self.layout_cfg, default_bg_pct=g_g[4]),
         }
 
+        self.irc = irsdk.IRSDK()
+        self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.timer.timeout.connect(self.tick)
+
         self._build_ui()
 
         default_csv = os.path.join(os.path.dirname(__file__), "reference.csv")
@@ -513,13 +546,44 @@ class ControlPanelWindow(QMainWindow):
             self.checkboxes[key].setChecked(enabled)
             w.setVisible(enabled)
 
-        self.irc = irsdk.IRSDK()
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.tick)
-        self.timer.start(16)
+        self.set_fps_mode(self.state.target_fps, restart_overlays=False)
+
+    def set_fps_mode(self, fps: int, restart_overlays: bool = True):
+        fps = 30 if fps == 30 else 60
+        self.state.target_fps = fps
+
+        self.timer.stop()
+        enable_windows_1ms_timer()
+
+        if restart_overlays and not self.hud_hidden:
+            for key, w in self.hud_widgets.items():
+                if self.checkboxes[key].isChecked():
+                    w.hide()
+                    w.show()
+                    w.set_locked(self.locked)
+                    w.update()
+
+        # Опрашиваем буфер каждые 2 мс: как только iRacing выложил новый 60-Гц тик (SessionTime изменился),
+        # мы мгновенно рисуем кадр без биения частот и пропусков!
+        self._last_synced_session_time = -1.0
+        self.timer.start(2)
+
+        self._update_fps_buttons_ui()
+        self._save_global_opts()
+
+    def _update_fps_buttons_ui(self):
+        for mode, btn in self.fps_buttons.items():
+            if mode == self.state.target_fps:
+                btn.setStyleSheet(
+                    "QPushButton { background-color: #124d5c; border: 2px solid #00f0ff; color: #ffffff; font-weight: bold; padding: 6px; }"
+                )
+            else:
+                btn.setStyleSheet("")
 
     def _apply_opts_from_cfg(self):
         opts = self.layout_cfg.get("_options", {})
+        saved_fps = int(opts.get("target_fps", 60))
+        self.state.target_fps = 30 if saved_fps == 30 else 60
         self.state.show_clutch = bool(opts.get("show_clutch", False))
         self.state.warn_lead_sec = float(opts.get("warn_lead_sec", 5.0))
         self.state.pedals_show_you_pct = bool(opts.get("pedals_show_you_pct", True))
@@ -571,7 +635,7 @@ class ControlPanelWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(10)
+        root.setSpacing(9)
 
         status_card = QFrame()
         status_card.setObjectName("card")
@@ -620,6 +684,19 @@ class ControlPanelWindow(QMainWindow):
         )
         btn_cockpit_cfg.clicked.connect(self.open_cockpit_settings)
         opt_layout.addWidget(btn_cockpit_cfg)
+
+        fps_row = QHBoxLayout()
+        lbl_fps_title = QLabel("⚡ Режим частоты оверлеев:")
+        lbl_fps_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #55efc4;")
+        fps_row.addWidget(lbl_fps_title)
+
+        self.fps_buttons = {}
+        for mode in self.FPS_MODES:
+            b = QPushButton(f"{mode} FPS")
+            b.clicked.connect(lambda _, m=mode: self.set_fps_mode(m, restart_overlays=True))
+            fps_row.addWidget(b)
+            self.fps_buttons[mode] = b
+        opt_layout.addLayout(fps_row)
 
         self.cb_clutch = QCheckBox("Показывать Сцепление в отдельном виджете Педалей и на Графике")
         self.cb_clutch.setChecked(self.state.show_clutch)
@@ -789,7 +866,7 @@ class ControlPanelWindow(QMainWindow):
             w.setVisible(not self.hud_hidden)
             w._save_state()
 
-        self._save_global_opts()
+        self.set_fps_mode(self.state.target_fps, restart_overlays=True)
         self._update_hotkey_labels()
         if self.cockpit_dlg is not None:
             self.cockpit_dlg.sync_all_from_state()
@@ -850,6 +927,7 @@ class ControlPanelWindow(QMainWindow):
 
     def _save_global_opts(self):
         self.layout_cfg["_options"] = {
+            "target_fps": self.state.target_fps,
             "show_clutch": self.state.show_clutch,
             "warn_lead_sec": self.state.warn_lead_sec,
             "pedals_show_you_pct": self.state.pedals_show_you_pct,
@@ -933,30 +1011,68 @@ class ControlPanelWindow(QMainWindow):
             self.load_reference_file(path)
 
     def _auto_calibrate_steer_range(self, rows):
-        """Определяет пиковый угол руля в эталоне и выставляет оптимальный диапазон шкалы (не менее 200°)."""
         if not rows:
             return
         max_rad = max(abs(r.get("SteeringWheelAngle", 0.0)) for r in rows)
         max_deg = math.degrees(max_rad)
-        # Добавляем 15% запаса сверху и округляем до 10 градусов (минимум 200°, максимум 360°)
         auto_deg = int(math.ceil((max_deg * 1.15) / 10.0) * 10)
         self.state.cp_steer_max_deg = max(200, min(360, auto_deg))
 
+    def _update_ref_label_text(self, filename: str, num_points: int):
+        mins = int(self.state.ref_lap_time // 60)
+        rem_s = self.state.ref_lap_time - mins * 60
+        lap_str = f"{mins}:{rem_s:06.3f}" if mins > 0 else f"{rem_s:06.3f} с"
+        self.lbl_ref.setText(
+            f"Эталон: {filename} ({num_points} точек, время круга: {lap_str}, руль: ±{self.state.cp_steer_max_deg}°)"
+        )
+
     def load_reference_file(self, path: str):
-        rows = load_garage61_csv(path)
+        rows = load_garage61_csv(path, self.state.track_len)
         if not rows:
             self.lbl_ref.setText(f"❌ Ошибка чтения файла: {os.path.basename(path)}")
             return
+        self._last_loaded_filename = os.path.basename(path)
         self.state.ref_data = rows
+        self.state.ref_pcts = [r["LapDistPct"] for r in rows]
+
+        step_g = max(1, len(rows) // 750)
+        self.state.ref_graph_pts = [
+            (r["LapDistPct"], r["Throttle"], r["Brake"], r.get("Clutch", 0.0))
+            for r in rows[::step_g]
+        ]
+        self.state.ref_graph_pcts = [item[0] for item in self.state.ref_graph_pts]
+
+        self.state.ref_lap_time = float(rows[-1]["Time"])
         self.state.brake_zones = self._detect_brake_zones(rows)
+        self._anchor_session_time = None
         if self.state.cp_steer_auto_scale:
             self._auto_calibrate_steer_range(rows)
             if self.cockpit_dlg is not None:
                 self.cockpit_dlg.sync_all_from_state()
-        lap_dur = rows[-1]["Time"]
-        self.lbl_ref.setText(
-            f"Эталон: {os.path.basename(path)} ({len(rows)} точек, ~{lap_dur:.1f} с, шкала руля: ±{self.state.cp_steer_max_deg}°)"
-        )
+        self._update_ref_label_text(self._last_loaded_filename, len(rows))
+
+    def _sync_track_length_from_iracing(self):
+        if self._track_len_checked:
+            return
+        self._track_len_checked = True
+        try:
+            wi = self.irc["WeekendInfo"]
+            if isinstance(wi, dict):
+                tl_str = str(wi.get("TrackLength", ""))
+                m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(km|mi)", tl_str, re.IGNORECASE)
+                if m:
+                    val = float(m.group(1))
+                    unit = m.group(2).lower()
+                    real_len_m = val * 1000.0 if unit == "km" else val * 1609.34
+                    if 500.0 < real_len_m < 30000.0:
+                        self.state.track_len = real_len_m
+                        if self.state.ref_data:
+                            rebuild_reference_time(self.state.ref_data, real_len_m)
+                            self.state.ref_lap_time = float(self.state.ref_data[-1]["Time"])
+                            self._anchor_session_time = None
+                            self._update_ref_label_text(self._last_loaded_filename, len(self.state.ref_data))
+        except Exception:
+            pass
 
     def _detect_brake_zones(self, rows):
         zones = []
@@ -988,56 +1104,87 @@ class ControlPanelWindow(QMainWindow):
             pass
 
     def tick(self):
-        self._poll_global_hotkeys()
+        now_pc = time.perf_counter()
 
         if not self.irc.is_connected:
-            self.irc.startup()
-
-        self.state.connected = bool(self.irc.is_connected)
-        if not self.state.connected:
-            self.lbl_status.setText("🟡 Ожидание iRacing (зайдите в сессию)...")
-            self.lbl_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffc107;")
-            for w in self.hud_widgets.values():
-                if w.isVisible():
-                    w.update()
+            if now_pc - self._fps_last_measure >= 0.05:
+                self._poll_global_hotkeys()
+                self.irc.startup()
+                self._track_len_checked = False
+                self._anchor_session_time = None
+                self._last_synced_session_time = -1.0
+                self._fps_last_measure = now_pc
+                self.lbl_status.setText("🟡 Ожидание iRacing (зайдите в сессию)...")
+                self.lbl_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffc107;")
             return
 
-        self.lbl_status.setText("🟢 iRacing Connected (Телеметрия активна)")
-        self.lbl_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #2ecc71;")
+        self.irc.freeze_var_buffer_latest()
+        session_time = float(self.irc["SessionTime"] or 0.0)
 
-        lap_pct = self.irc["LapDistPct"]
-        if lap_pct is None:
+        # ЖЁСТКАЯ ФАЗОВАЯ СИНХРОНИЗАЦИЯ С ДВИЖКОМ iRACING (Phase-Locked Loop):
+        # Если iRacing ещё не обновил физический тик (SessionTime тот же самый) — выходим мгновенно!
+        # В режиме 30 FPS ждём смены на >= 0.028 с (ровно 2 тика iRacing), в режиме 60 FPS — каждого нового тика.
+        min_step = 0.028 if self.state.target_fps == 30 else 0.001
+        if 0.0 <= (session_time - self._last_synced_session_time) < min_step:
             return
+        self._last_synced_session_time = session_time
 
-        speed_ms = self.irc["Speed"] or 0.0
-        self.state.lap_pct = float(lap_pct)
-        self.state.speed_kmh = float(speed_ms) * 3.6
+        self._poll_global_hotkeys()
+        self._tick_counter += 1
+        self._fps_frame_count += 1
+
+        elapsed_fps = now_pc - self._fps_last_measure
+        if elapsed_fps >= 0.5:
+            self.state.actual_fps = self._fps_frame_count / elapsed_fps
+            self._fps_frame_count = 0
+            self._fps_last_measure = now_pc
+            self.lbl_status.setText(
+                f"🟢 iRacing SyncLocked (Трасса: {self.state.track_len:.0f} м  |  Режим: {self.state.target_fps} FPS  |  Факт: {self.state.actual_fps:.0f} FPS)"
+            )
+            self.lbl_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #2ecc71;")
+
+        self.state.connected = True
+        self._sync_track_length_from_iracing()
+
+        raw_lap_pct = self.irc["LapDistPct"]
+        if raw_lap_pct is None:
+            return
+        raw_lap_pct = float(raw_lap_pct)
+
+        speed_ms = float(self.irc["Speed"] or 0.0)
+        self.state.lap_pct = raw_lap_pct
+        self.state.speed_kmh = speed_ms * 3.6
         self.state.throttle = float(self.irc["Throttle"] or 0.0)
         self.state.brake = float(self.irc["Brake"] or 0.0)
 
-        raw_clutch = self.irc["Clutch"]
-        self.state.clutch = max(0.0, min(1.0, 1.0 - float(raw_clutch))) if raw_clutch is not None else 0.0
-
+        raw_cl_val = self.irc["Clutch"]
+        self.state.clutch = max(0.0, min(1.0, 1.0 - float(raw_cl_val))) if raw_cl_val is not None else 0.0
         self.state.steer_rad = float(self.irc["SteeringWheelAngle"] or 0.0)
         self.state.gear = int(self.irc["Gear"] or 0)
         self.state.lap_time = float(self.irc["LapCurrentLapTime"] or 0.0)
+        on_pit_road = bool(self.irc["OnPitRoad"] or False)
 
-        self.state.current_lap = int(self.irc["Lap"] or 0)
-        self.state.position = int(self.irc["PlayerCarPosition"] or 0)
-        rem_raw = self.irc["SessionLapsRemainEx"]
-        if rem_raw is None:
-            rem_raw = self.irc["SessionLapsRemain"]
-        if rem_raw is not None and 0 <= int(rem_raw) < 3000:
-            self.state.laps_remain = int(rem_raw)
-            self.state.total_laps = max(self.state.current_lap, self.state.current_lap + self.state.laps_remain - 1)
-        else:
-            self.state.laps_remain = -1
-            self.state.total_laps = 0
+        if self._tick_counter % 10 == 0:
+            self.state.current_lap = int(self.irc["Lap"] or 0)
+            self.state.position = int(self.irc["PlayerCarPosition"] or 0)
+            rem_raw = self.irc["SessionLapsRemainEx"]
+            if rem_raw is None:
+                rem_raw = self.irc["SessionLapsRemain"]
+            if rem_raw is not None and 0 <= int(rem_raw) < 3000:
+                self.state.laps_remain = int(rem_raw)
+                self.state.total_laps = max(self.state.current_lap, self.state.current_lap + self.state.laps_remain - 1)
+            else:
+                self.state.laps_remain = -1
+                self.state.total_laps = 0
 
-        self.state.player_trace.append((self.state.lap_pct, self.state.throttle, self.state.brake, self.state.clutch))
+        if self._last_trace_pct is None or abs(raw_lap_pct - self._last_trace_pct) >= 0.0004:
+            self.state.player_trace.append((raw_lap_pct, self.state.throttle, self.state.brake, self.state.clutch))
+            self._last_trace_pct = raw_lap_pct
+
+        prev_banner = self.state.banner_mode
 
         if self.state.ref_data:
-            t = get_target_state(self.state.lap_pct, self.state.ref_data)
+            t = get_target_state(raw_lap_pct, self.state.ref_data, self.state.ref_pcts)
             self.state.t_speed = t["Speed"]
             self.state.t_throttle = t["Throttle"]
             self.state.t_brake = t["Brake"]
@@ -1048,16 +1195,56 @@ class ControlPanelWindow(QMainWindow):
             self.state.ref_idx = t["Index"]
 
             self.state.delta_speed = self.state.speed_kmh - self.state.t_speed
-            if self.state.lap_time > 1.0:
-                self.state.delta_sec = self.state.lap_time - self.state.t_time
-                if abs(self.state.delta_sec) < 25.0:
+
+            prev_pct = self._prev_lap_pct
+            self._prev_lap_pct = raw_lap_pct
+
+            if on_pit_road or speed_ms < 2.0:
+                self._anchor_session_time = None
+                self.state.delta_valid = False
+            else:
+                crossed_sf = (prev_pct is not None and prev_pct > 0.85 and raw_lap_pct < 0.15)
+                teleported = (prev_pct is not None and abs(raw_lap_pct - prev_pct) > 0.08 and not crossed_sf)
+
+                if crossed_sf:
+                    self._anchor_session_time = session_time - (raw_lap_pct * self.state.track_len) / max(5.0, speed_ms)
+                    self._anchor_ref_time = 0.0
+                    self.state.delta_history.clear()
+                elif self._anchor_session_time is None or teleported:
+                    self._anchor_session_time = session_time
+                    self._anchor_ref_time = self.state.t_time
+                    self.state.delta_history.clear()
+
+                you_elapsed = session_time - self._anchor_session_time
+                ref_elapsed = self.state.t_time - self._anchor_ref_time
+                self.state.delta_sec = you_elapsed - ref_elapsed
+                self.state.delta_valid = True
+                if self._tick_counter % 2 == 0 and abs(self.state.delta_sec) < 30.0:
                     self.state.delta_history.append(self.state.delta_sec)
 
             self._update_brake_coach(speed_ms)
 
-        for w in self.hud_widgets.values():
-            if w.isVisible():
-                w.update()
+        w_steer = self.hud_widgets["steer"]
+        if w_steer.isVisible():
+            w_steer.update()
+
+        w_ped = self.hud_widgets["pedals"]
+        if w_ped.isVisible():
+            w_ped.update()
+
+        is_even = (self._tick_counter % 2 == 0) or (self.state.target_fps == 30)
+
+        w_graph = self.hud_widgets["graph"]
+        if w_graph.isVisible() and is_even:
+            w_graph.update()
+
+        w_delta = self.hud_widgets["delta"]
+        if w_delta.isVisible() and is_even:
+            w_delta.update()
+
+        w_banner = self.hud_widgets["banner"]
+        if w_banner.isVisible() and (self.state.banner_mode or prev_banner or not self.locked) and is_even:
+            w_banner.update()
 
     def _update_brake_coach(self, speed_ms: float):
         if self.state.t_brake >= 0.12 or (self._brake_hold_active and self.state.t_brake >= 0.06):
@@ -1110,6 +1297,7 @@ class ControlPanelWindow(QMainWindow):
             self.state.banner_mode = "THROTTLE"
 
     def closeEvent(self, event):
+        disable_windows_1ms_timer()
         if self.cockpit_dlg is not None:
             self.cockpit_dlg.close()
         for w in self.hud_widgets.values():
