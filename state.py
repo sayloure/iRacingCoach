@@ -20,9 +20,30 @@ class TelemetryState:
         self.laps_remain = -1
         self.position = 0
 
-        # Настройки отображения
+        # Глобальные настройки
         self.show_clutch = False
         self.warn_lead_sec = 5.0
+
+        # Вкл/Выкл элементов центрального Кокпит-виджета
+        self.cp_show_ribbon = True
+        self.cp_show_player_on_rib = True
+        self.cp_show_pedal_match = True
+        self.cp_show_steer = True
+        self.cp_show_gear = True
+        self.cp_show_speed = True
+        self.cp_show_brake = True
+        self.cp_show_throttle = True
+        self.cp_show_clutch = False
+
+        # Индивидуальная прозрачность (10..100%) каждого элемента Кокпита
+        self.cp_op_ribbon = 100
+        self.cp_op_player_on_rib = 100
+        self.cp_op_steer = 100
+        self.cp_op_gear = 100
+        self.cp_op_speed = 100
+        self.cp_op_brake = 100
+        self.cp_op_throttle = 100
+        self.cp_op_clutch = 100
 
         # Эталон в текущей точке
         self.t_speed = 0.0
@@ -43,5 +64,5 @@ class TelemetryState:
 
         self.ref_data = []
         self.brake_zones = []
-        self.player_trace = deque(maxlen=260)  # (lap_pct, throttle, brake, clutch)
+        self.player_trace = deque(maxlen=300)
         self.delta_history = deque(maxlen=120)

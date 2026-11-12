@@ -9,7 +9,7 @@ except ImportError:
     winsound = None
 
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout,
+    QApplication, QWidget, QMainWindow, QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QCheckBox, QFileDialog, QFrame, QSlider
 )
 from PyQt6.QtCore import Qt, QTimer
@@ -39,19 +39,98 @@ def qt_key_to_vk(qt_key: int, native_vk: int) -> int:
     return 0x77
 
 
+class CockpitSettingsDialog(QDialog):
+    """Отдельное окно детальной настройки элементов и прозрачности центрального Кокпит-виджета."""
+    def __init__(self, parent_window):
+        super().__init__(parent_window)
+        self.pw = parent_window
+        self.state = parent_window.state
+        self.setWindowTitle("⚙ Настройка элементов виджета Кокпита")
+        self.resize(520, 480)
+        self.setStyleSheet(parent_window.styleSheet())
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        lbl_info = QLabel("Включай/выключай отдельные элементы кокпита и настраивай их прозрачность:")
+        lbl_info.setStyleSheet("font-weight: bold; color: #00d2ff; font-size: 13px;")
+        root.addWidget(lbl_info)
+
+        card = QFrame()
+        card.setObjectName("card")
+        c_layout = QVBoxLayout(card)
+        c_layout.setSpacing(8)
+
+        # (attr_show, attr_opacity, Название)
+        items = [
+            ("cp_show_ribbon", "cp_op_ribbon", "3D-Траектория со степенью нажатия рефа"),
+            ("cp_show_player_on_rib", "cp_op_player_on_rib", "Полоса моей позиции и ползунок с засечками"),
+            ("cp_show_pedal_match", None, "Бирюзовая вспышка полосы при точном попадании в педаль"),
+            ("cp_show_steer", "cp_op_steer", "Дуга угла Руля и градусы (ТЫ / ЭТАЛОН)"),
+            ("cp_show_gear", "cp_op_gear", "Крупный щиток Передачи (Gear Coach)"),
+            ("cp_show_speed", "cp_op_speed", "Индикатор Скорости (км/ч)"),
+            ("cp_show_brake", "cp_op_brake", "Встроенная шкала Тормоза (слева)"),
+            ("cp_show_throttle", "cp_op_throttle", "Встроенная шкала Газа (справа)"),
+            ("cp_show_clutch", "cp_op_clutch", "Встроенная шкала Сцепления (слева)"),
+        ]
+
+        for show_attr, op_attr, title in items:
+            row = QHBoxLayout()
+            cb = QCheckBox(title)
+            cb.setChecked(getattr(self.state, show_attr))
+            cb.toggled.connect(lambda checked, a=show_attr: self._on_show_changed(a, checked))
+            row.addWidget(cb, stretch=3)
+
+            if op_attr is not None:
+                cur_op = getattr(self.state, op_attr)
+                lbl_op = QLabel(f"Прозр: {cur_op}%")
+                lbl_op.setFixedWidth(85)
+                lbl_op.setStyleSheet("font-size: 11px; color: #9aa5b8;")
+
+                sld = QSlider(Qt.Orientation.Horizontal)
+                sld.setRange(10, 100)
+                sld.setValue(cur_op)
+                sld.setFixedWidth(120)
+                sld.valueChanged.connect(
+                    lambda val, a=op_attr, lbl=lbl_op: self._on_op_changed(a, val, lbl)
+                )
+                row.addWidget(lbl_op)
+                row.addWidget(sld)
+
+            c_layout.addLayout(row)
+
+        root.addWidget(card)
+
+        btn_close = QPushButton("✓ Готово")
+        btn_close.clicked.connect(self.accept)
+        root.addWidget(btn_close)
+
+    def _on_show_changed(self, attr: str, checked: bool):
+        setattr(self.state, attr, checked)
+        self.pw._save_global_opts()
+        self.pw.hud_widgets["steer"].update()
+
+    def _on_op_changed(self, attr: str, val: int, label: QLabel):
+        setattr(self.state, attr, int(val))
+        label.setText(f"Прозр: {val}%")
+        self.pw._save_global_opts()
+        self.pw.hud_widgets["steer"].update()
+
+
 class ControlPanelWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("iRacing Coach — Панель управления")
-        self.resize(610, 680)
+        self.resize(620, 650)
         self.setStyleSheet("""
-            QMainWindow, QWidget { background-color: #10151e; color: #e4e8f0; font-family: 'Segoe UI'; }
+            QMainWindow, QDialog, QWidget { background-color: #10151e; color: #e4e8f0; font-family: 'Segoe UI'; }
             QPushButton {
                 background-color: #1a2333; border: 1px solid #2e3e58; border-radius: 6px;
                 padding: 7px 11px; font-weight: bold; color: #ffffff;
             }
             QPushButton:hover { background-color: #25334a; border-color: #00d2ff; }
-            QCheckBox { font-size: 13px; spacing: 8px; padding: 2px; font-weight: bold; }
+            QCheckBox { font-size: 12px; spacing: 6px; padding: 2px; font-weight: bold; }
             QFrame#card { background-color: #161d29; border: 1px solid #243044; border-radius: 8px; }
             QSlider::groove:horizontal { height: 6px; background: #243044; border-radius: 3px; }
             QSlider::sub-page:horizontal { background: #00d2ff; border-radius: 3px; }
@@ -63,12 +142,29 @@ class ControlPanelWindow(QMainWindow):
         self.locked = False
         self.hud_hidden = False
         self._binding_target = None
+        self.cockpit_dlg = None
 
         opts = self.layout_cfg.get("_options", {})
         self.state.show_clutch = bool(opts.get("show_clutch", False))
         self.state.warn_lead_sec = float(opts.get("warn_lead_sec", 5.0))
-        self.lock_vk = int(opts.get("lock_vk", 0x77))  # F8
-        self.hide_vk = int(opts.get("hide_vk", 0x78))  # F9
+        self.lock_vk = int(opts.get("lock_vk", 0x77))
+        self.hide_vk = int(opts.get("hide_vk", 0x78))
+
+        # Загружаем вкл/выкл и прозрачность элементов кокпита
+        for attr in (
+            "cp_show_ribbon", "cp_show_player_on_rib", "cp_show_pedal_match",
+            "cp_show_steer", "cp_show_gear", "cp_show_speed",
+            "cp_show_brake", "cp_show_throttle", "cp_show_clutch"
+        ):
+            if attr in opts:
+                setattr(self.state, attr, bool(opts[attr]))
+
+        for op_attr in (
+            "cp_op_ribbon", "cp_op_player_on_rib", "cp_op_steer",
+            "cp_op_gear", "cp_op_speed", "cp_op_brake", "cp_op_throttle", "cp_op_clutch"
+        ):
+            if op_attr in opts:
+                setattr(self.state, op_attr, int(opts[op_attr]))
 
         self._lock_key_was_down = False
         self._hide_key_was_down = False
@@ -103,12 +199,14 @@ class ControlPanelWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(16, 14, 16, 14)
+        root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
 
+        # 1. Статус
         status_card = QFrame()
         status_card.setObjectName("card")
         sc_layout = QVBoxLayout(status_card)
+        sc_layout.setContentsMargins(10, 8, 10, 8)
         self.lbl_status = QLabel("🟡 Ожидание подключения к iRacing...")
         self.lbl_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffc107;")
         self.lbl_ref = QLabel("Эталон: не загружен")
@@ -117,6 +215,7 @@ class ControlPanelWindow(QMainWindow):
         sc_layout.addWidget(self.lbl_ref)
         root.addWidget(status_card)
 
+        # 2. Основные кнопки
         btn_row = QHBoxLayout()
         self.btn_load = QPushButton("📂 Загрузить эталон (.csv)")
         self.btn_load.clicked.connect(self.open_file_dialog)
@@ -129,6 +228,7 @@ class ControlPanelWindow(QMainWindow):
         btn_row.addWidget(self.btn_hide)
         root.addLayout(btn_row)
 
+        # 3. Бинды клавиш
         bind_row = QHBoxLayout()
         self.btn_bind_lock = QPushButton()
         self.btn_bind_lock.clicked.connect(lambda: self._start_rebinding("lock"))
@@ -139,14 +239,22 @@ class ControlPanelWindow(QMainWindow):
         root.addLayout(bind_row)
         self._update_hotkey_labels()
 
+        # 4. Кнопка открытия отдельного окна настройки Кокпита + общие настройки
         opt_card = QFrame()
         opt_card.setObjectName("card")
         opt_layout = QVBoxLayout(opt_card)
-        lbl_opt = QLabel("Настройки телеметрии и предупреждений:")
-        lbl_opt.setStyleSheet("font-weight: bold; color: #00d2ff;")
-        opt_layout.addWidget(lbl_opt)
+        opt_layout.setContentsMargins(10, 10, 10, 10)
+        opt_layout.setSpacing(8)
 
-        self.cb_clutch = QCheckBox("Показывать педаль Сцепления (CLUTCH) в педалях и на графике")
+        btn_cockpit_cfg = QPushButton("🎛 Настроить элементы и прозрачность виджета Кокпита...")
+        btn_cockpit_cfg.setStyleSheet(
+            "QPushButton { background-color: #16364d; border: 1px solid #00d2ff; padding: 9px; font-size: 13px; }"
+            "QPushButton:hover { background-color: #1f4c6b; }"
+        )
+        btn_cockpit_cfg.clicked.connect(self.open_cockpit_settings)
+        opt_layout.addWidget(btn_cockpit_cfg)
+
+        self.cb_clutch = QCheckBox("Показывать Сцепление в отдельном виджете Педалей и на Графике")
         self.cb_clutch.setChecked(self.state.show_clutch)
         self.cb_clutch.toggled.connect(self._on_clutch_toggled)
         opt_layout.addWidget(self.cb_clutch)
@@ -163,11 +271,13 @@ class ControlPanelWindow(QMainWindow):
         opt_layout.addLayout(lead_row)
         root.addWidget(opt_card)
 
+        # 5. Виджеты и их общая прозрачность
         chk_card = QFrame()
         chk_card.setObjectName("card")
         chk_layout = QVBoxLayout(chk_card)
-        lbl_h = QLabel("Виджеты и прозрачность (растягивай за уголок ◢ каждого окна):")
-        lbl_h.setStyleSheet("font-weight: bold; color: #00d2ff; margin-bottom: 4px;")
+        chk_layout.setContentsMargins(10, 8, 10, 8)
+        lbl_h = QLabel("Окна оверлеев и общая прозрачность (растягивай за уголок ◢ каждого окна):")
+        lbl_h.setStyleSheet("font-weight: bold; color: #00d2ff; margin-bottom: 2px;")
         chk_layout.addWidget(lbl_h)
 
         self.checkboxes = {}
@@ -191,7 +301,7 @@ class ControlPanelWindow(QMainWindow):
             self.checkboxes[key] = cb
 
             sliders_row = QHBoxLayout()
-            sliders_row.setContentsMargins(22, 0, 0, 5)
+            sliders_row.setContentsMargins(22, 0, 0, 4)
 
             lbl_bg = QLabel(f"Фон: {w.bg_opacity_pct}%")
             lbl_bg.setFixedWidth(72)
@@ -221,12 +331,14 @@ class ControlPanelWindow(QMainWindow):
             chk_layout.addLayout(block)
 
         root.addWidget(chk_card)
-
-        hint = QLabel("💡 Каждый виджет теперь лежит в своём файле в папке widgets/ — его можно менять независимо от остальных.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("font-size: 11px; color: #7f8c9f;")
-        root.addWidget(hint)
         root.addStretch()
+
+    def open_cockpit_settings(self):
+        if self.cockpit_dlg is None:
+            self.cockpit_dlg = CockpitSettingsDialog(self)
+        self.cockpit_dlg.show()
+        self.cockpit_dlg.raise_()
+        self.cockpit_dlg.activateWindow()
 
     def _start_rebinding(self, target: str):
         self._binding_target = target
@@ -280,6 +392,23 @@ class ControlPanelWindow(QMainWindow):
             "warn_lead_sec": self.state.warn_lead_sec,
             "lock_vk": self.lock_vk,
             "hide_vk": self.hide_vk,
+            "cp_show_ribbon": self.state.cp_show_ribbon,
+            "cp_show_player_on_rib": self.state.cp_show_player_on_rib,
+            "cp_show_pedal_match": self.state.cp_show_pedal_match,
+            "cp_show_steer": self.state.cp_show_steer,
+            "cp_show_gear": self.state.cp_show_gear,
+            "cp_show_speed": self.state.cp_show_speed,
+            "cp_show_brake": self.state.cp_show_brake,
+            "cp_show_throttle": self.state.cp_show_throttle,
+            "cp_show_clutch": self.state.cp_show_clutch,
+            "cp_op_ribbon": self.state.cp_op_ribbon,
+            "cp_op_player_on_rib": self.state.cp_op_player_on_rib,
+            "cp_op_steer": self.state.cp_op_steer,
+            "cp_op_gear": self.state.cp_op_gear,
+            "cp_op_speed": self.state.cp_op_speed,
+            "cp_op_brake": self.state.cp_op_brake,
+            "cp_op_throttle": self.state.cp_op_throttle,
+            "cp_op_clutch": self.state.cp_op_clutch,
         }
         save_config(self.layout_cfg)
 
@@ -492,6 +621,8 @@ class ControlPanelWindow(QMainWindow):
             self.state.banner_mode = "THROTTLE"
 
     def closeEvent(self, event):
+        if self.cockpit_dlg is not None:
+            self.cockpit_dlg.close()
         for w in self.hud_widgets.values():
             w.close()
         self.irc.shutdown()

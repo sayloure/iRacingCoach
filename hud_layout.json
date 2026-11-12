@@ -48,6 +48,23 @@
     "show_clutch": true,
     "warn_lead_sec": 8.0,
     "lock_vk": 119,
-    "hide_vk": 120
+    "hide_vk": 120,
+    "cp_show_ribbon": true,
+    "cp_show_player_on_rib": true,
+    "cp_show_pedal_match": true,
+    "cp_show_steer": true,
+    "cp_show_gear": true,
+    "cp_show_speed": true,
+    "cp_show_brake": true,
+    "cp_show_throttle": true,
+    "cp_show_clutch": true,
+    "cp_op_ribbon": 100,
+    "cp_op_player_on_rib": 100,
+    "cp_op_steer": 100,
+    "cp_op_gear": 100,
+    "cp_op_speed": 100,
+    "cp_op_brake": 100,
+    "cp_op_throttle": 100,
+    "cp_op_clutch": 100
   }
 }

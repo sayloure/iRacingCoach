@@ -8,8 +8,8 @@ from .base import DraggableHUDWidget
 def draw_unified_pedal_bar(p: QPainter, x_center: int, top_y: int, bar_w: int, bar_h: int,
                            you_val: float, ref_val: float, label: str, main_col: QColor):
     """
-    - Сзади на всю ширину стакана (полупрозрачный фон с кромкой) — ТВОЁ нажатие (YOU).
-    - Спереди внутри стакана (яркий неоновый градиент + светящаяся белая планка) — ЭТАЛОН (REF).
+    - Внутри стакана (яркая цветная неоновая колонка без палочек) — ЭТАЛОН (REF).
+    - На всю ширину стакана (полупрозрачный фон + яркая горизонтальная палочка-указатель) — ТВОЁ нажатие (YOU).
     """
     x0 = x_center - bar_w // 2
     you_v = max(0.0, min(1.0, you_val))
@@ -25,28 +25,29 @@ def draw_unified_pedal_bar(p: QPainter, x_center: int, top_y: int, bar_w: int, b
     # 1. ЗАДНИЙ ФОН — ТВОЁ НАЖАТИЕ (YOU)
     yh = int(bar_h * you_v)
     if yh > 0:
-        you_bg = QColor(main_col.red(), main_col.green(), main_col.blue(), 75)
+        you_bg = QColor(main_col.red(), main_col.green(), main_col.blue(), 80)
         p.fillRect(x0 + 1, top_y + bar_h - yh, bar_w - 2, yh, you_bg)
-        uy = top_y + bar_h - yh
-        p.setPen(QPen(QColor(255, 255, 255, 160), 1.5))
-        p.drawLine(x0, uy, x0 + bar_w, uy)
 
-    # 2. ПЕРЕДНИЙ ПЛАН — ЭТАЛОН (REF)
+    # 2. ПЕРЕДНИЙ ПЛАН — ЭТАЛОН (REF): чистая цветная шкала без палочек
     rh = int(bar_h * ref_v)
-    pad = max(3, bar_w // 6)
+    pad = max(4, bar_w // 5)
     if rh > 0:
         ry = top_y + bar_h - rh
         grad = QLinearGradient(0, ry, 0, top_y + bar_h)
-        grad.setColorAt(0.0, QColor(min(255, main_col.red() + 55), min(255, main_col.green() + 55), min(255, main_col.blue() + 55), 255))
-        grad.setColorAt(0.3, QColor(main_col.red(), main_col.green(), main_col.blue(), 245))
-        grad.setColorAt(1.0, QColor(int(main_col.red() * 0.55), int(main_col.green() * 0.55), int(main_col.blue() * 0.55), 230))
+        grad.setColorAt(0.0, QColor(min(255, main_col.red() + 45), min(255, main_col.green() + 45), min(255, main_col.blue() + 45), 250))
+        grad.setColorAt(0.35, QColor(main_col.red(), main_col.green(), main_col.blue(), 240))
+        grad.setColorAt(1.0, QColor(int(main_col.red() * 0.55), int(main_col.green() * 0.55), int(main_col.blue() * 0.55), 225))
         p.fillRect(QRectF(x0 + pad, ry, bar_w - pad * 2, rh), QBrush(grad))
 
+    # 3. Яркая горизонтальная ПАЛОЧКА-УКАЗАТЕЛЬ ТВОЕГО НАЖАТИЯ (поверх шкалы, чтобы ты видел свой уровень!)
+    if you_v > 0.01:
+        uy = top_y + bar_h - yh
         p.setPen(QPen(QColor(main_col.red(), main_col.green(), main_col.blue(), 140), 5))
-        p.drawLine(x0 - 1, ry, x0 + bar_w + 1, ry)
+        p.drawLine(x0 - 2, uy, x0 + bar_w + 2, uy)
         p.setPen(QPen(Qt.GlobalColor.white, 2.5))
-        p.drawLine(x0 - 2, ry, x0 + bar_w + 2, ry)
+        p.drawLine(x0 - 3, uy, x0 + bar_w + 3, uy)
 
+    p.setBrush(Qt.BrushStyle.NoBrush)
     diff = abs(you_v - ref_v)
     border_col = QColor(60, 255, 180, 220) if (ref_v > 0.1 and diff < 0.08) else QColor(110, 140, 165, 150)
     p.setPen(QPen(border_col, 1.3))
